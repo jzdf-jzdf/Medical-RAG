@@ -1,0 +1,23 @@
+services:
+  db:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_DB: evaluation_db
+      POSTGRES_USER: evaluation
+      POSTGRES_PASSWORD: evaluation
+    ports: ["5435:5432"]
+    volumes: ["evaluation-db:/var/lib/postgresql/data"]
+  redis:
+    image: redis:7-alpine
+    ports: ["6379:6379"]
+  api:
+    build: .
+    env_file: .env
+    environment:
+      DATABASE_URL: postgresql+asyncpg://evaluation:evaluation@db:5432/evaluation_db
+      REDIS_URL: redis://redis:6379/0
+    ports: ["8003:8003"]
+    depends_on: [db, redis]
+volumes:
+  evaluation-db:
+

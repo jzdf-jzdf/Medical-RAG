@@ -1,0 +1,33 @@
+from app.models.knowledge import (
+    Chunk,
+    Collection,
+    Disease,
+    Document,
+    DocumentFile,
+    DocumentVersion,
+    EvidenceSpan,
+    ExtractionRun,
+    IndexVersion,
+    Outcome,
+    PicoElement,
+    ReviewDecision,
+    Section,
+    Study,
+)
+
+__all__ = [
+    "Chunk",
+    "Collection",
+    "Disease",
+    "Document",
+    "DocumentFile",
+    "DocumentVersion",
+    "EvidenceSpan",
+    "ExtractionRun",
+    "IndexVersion",
+    "Outcome",
+    "PicoElement",
+    "ReviewDecision",
+    "Section",
+    "Study",
+]

@@ -1,0 +1,122 @@
+name: medical-rag
+
+services:
+  gateway:
+    image: nginx:1.27-alpine
+    ports: ["8080:8080"]
+    volumes:
+      - ./nginx.conf:/etc/nginx/nginx.conf:ro
+    depends_on: [knowledge-web, agent-web, evaluation-web, knowledge-api, agent-api, evaluation-api]
+
+  knowledge-web:
+    build: ../medical-knowledge-web
+  agent-web:
+    build: ../medical-agent-web
+  evaluation-web:
+    build: ../medical-evaluation-web
+
+  knowledge-api:
+    build: ../medical-knowledge-api
+    environment:
+      APP_ENV: development
+      DATABASE_URL: postgresql+asyncpg://knowledge:knowledge@knowledge-db:5432/knowledge_db
+      ALLOWED_ORIGINS: http://localhost:8080
+      WORKSPACE_ROOT: /data
+      QDRANT_URL: http://qdrant:6333
+    volumes:
+      - knowledge-files:/data
+    depends_on:
+      knowledge-db:
+        condition: service_healthy
+      qdrant:
+        condition: service_started
+
+  agent-api:
+    build: ../medical-agent-api
+    environment:
+      APP_ENV: development
+      DATABASE_URL: postgresql+asyncpg://agent:agent@agent-db:5432/agent_db
+      ALLOWED_ORIGINS: http://localhost:8080
+      MODEL_PROVIDER: ${MODEL_PROVIDER:-deepseek}
+      MODEL_NAME: ${MODEL_NAME:-deepseek-chat}
+      MODEL_BASE_URL: ${MODEL_BASE_URL:-https://api.deepseek.com}
+      MODEL_API_KEY: ${MODEL_API_KEY:-}
+      MCP_SERVERS_JSON: ${MCP_SERVERS_JSON:-[]}
+      WORKSPACE_ROOT: /data
+    volumes:
+      - agent-runtime:/data
+    depends_on:
+      agent-db:
+        condition: service_healthy
+
+  evaluation-api:
+    build: ../medical-evaluation-api
+    environment:
+      APP_ENV: development
+      DATABASE_URL: postgresql+asyncpg://evaluation:evaluation@evaluation-db:5432/evaluation_db
+      REDIS_URL: redis://redis:6379/0
+      KNOWLEDGE_API_URL: http://knowledge-api:8001
+      AGENT_API_URL: http://agent-api:8002
+      ALLOWED_ORIGINS: http://localhost:8080
+    depends_on:
+      evaluation-db:
+        condition: service_healthy
+      redis:
+        condition: service_started
+
+  knowledge-db:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_DB: knowledge_db
+      POSTGRES_USER: knowledge
+      POSTGRES_PASSWORD: knowledge
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U knowledge -d knowledge_db"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+    volumes: ["knowledge-db:/var/lib/postgresql/data"]
+
+  agent-db:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_DB: agent_db
+      POSTGRES_USER: agent
+      POSTGRES_PASSWORD: agent
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U agent -d agent_db"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+    volumes: ["agent-db:/var/lib/postgresql/data"]
+
+  evaluation-db:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_DB: evaluation_db
+      POSTGRES_USER: evaluation
+      POSTGRES_PASSWORD: evaluation
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U evaluation -d evaluation_db"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+    volumes: ["evaluation-db:/var/lib/postgresql/data"]
+
+  redis:
+    image: redis:7-alpine
+    volumes: ["redis-data:/data"]
+
+  qdrant:
+    image: qdrant/qdrant:v1.12.5
+    volumes: ["qdrant-data:/qdrant/storage"]
+
+volumes:
+  knowledge-db:
+  agent-db:
+  evaluation-db:
+  redis-data:
+  qdrant-data:
+  knowledge-files:
+  agent-runtime:
+

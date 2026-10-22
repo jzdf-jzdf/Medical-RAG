@@ -22,6 +22,7 @@ docker compose --profile observability up -d prometheus
 
 - 平台入口：`http://localhost:8080`
 - Knowledge：`/knowledge/`，API：`/api/knowledge/`
+- Knowledge MCP：`http://localhost:8080/mcp/`（Streamable HTTP）
 - Agent：`/agent/`，API：`/api/agent/`
 - Evaluation：`/evaluation/`，API：`/api/evaluation/`
 - Prometheus：`http://localhost:9090`（observability profile）

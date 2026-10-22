@@ -1,6 +1,600 @@
 <script setup lang="ts">
-import { ref } from 'vue'
-const prompt=ref('')
-const traces=[['Knowledge MCP','检索已审核脑出血指南','完成 · 428 ms'],['PubMed MCP','补充近五年系统综述','完成 · 712 ms'],['证据编排','保留 5 个稳定标识','完成']]
+import { computed, nextTick, onMounted, ref } from 'vue'
+
+import {
+  createModel,
+  createConversation,
+  deleteConversation,
+  deleteModel,
+  getConversation,
+  getHealth,
+  listConversations,
+  listModels,
+  sendChat,
+  updateModel,
+  type ChatResult,
+  type ConversationSummary,
+  type ModelConfig,
+  type ModelConfigInput,
+  type ToolCall,
+} from './api'
+
+interface ChatMessage {
+  id: string
+  role: 'user' | 'assistant'
+  content: string
+  createdAt: string
+  result?: ChatResult
+}
+
+interface ModelForm extends ModelConfigInput {
+  api_key: string
+}
+
+const userId = getUserId()
+const conversations = ref<ConversationSummary[]>([])
+const activeId = ref<string | null>(null)
+const messages = ref<ChatMessage[]>([])
+const prompt = ref('')
+const loading = ref(false)
+const loadingConversation = ref(false)
+const deletingConversationId = ref<string | null>(null)
+const online = ref(false)
+const error = ref('')
+const sidebarOpen = ref(false)
+const inspectorOpen = ref(false)
+const modelSettingsOpen = ref(false)
+const selectedResult = ref<ChatResult | null>(null)
+const messageList = ref<HTMLElement | null>(null)
+const models = ref<ModelConfig[]>([])
+const selectedModelId = ref(localStorage.getItem('medical-agent-model-id') || '')
+const editingModelId = ref<string | null>(null)
+const modelFormOpen = ref(false)
+const modelSaving = ref(false)
+const modelError = ref('')
+const modelForm = ref<ModelForm>(newModelForm())
+
+const activeConversation = computed(() =>
+  conversations.value.find((item) => item.id === activeId.value),
+)
+const toolCalls = computed<ToolCall[]>(() => selectedResult.value?.tool_calls ?? [])
+const evidenceCount = computed(() => selectedResult.value?.citations.length ?? 0)
+const activeModel = computed(() =>
+  models.value.find((item) => item.id === selectedModelId.value),
+)
+const activeModelLabel = computed(() => activeModel.value?.name || '环境默认模型')
+
+onMounted(async () => {
+  await Promise.all([refreshHealth(), loadConversations(), loadModels()])
+})
+
+async function refreshHealth() {
+  try {
+    online.value = (await getHealth()).status === 'ok'
+  } catch {
+    online.value = false
+  }
+}
+
+async function loadConversations() {
+  try {
+    conversations.value = await listConversations(userId)
+    if (conversations.value.length) {
+      await selectConversation(conversations.value[0].id)
+    }
+  } catch (cause) {
+    showError(cause)
+  }
+}
+
+async function loadModels() {
+  try {
+    models.value = await listModels()
+    const selectedExists = models.value.some((item) => item.id === selectedModelId.value)
+    if (!selectedExists) {
+      selectedModelId.value = models.value.find((item) => item.is_default)?.id || ''
+    }
+    persistSelectedModel()
+  } catch (cause) {
+    showError(cause)
+  }
+}
+
+async function selectConversation(id: string) {
+  if (loading.value || loadingConversation.value) return
+  loadingConversation.value = true
+  error.value = ''
+  try {
+    const conversation = await getConversation(id, userId)
+    activeId.value = id
+    messages.value = conversation.messages.map((item) => ({
+      id: item.id,
+      role: item.role,
+      content: item.content,
+      createdAt: item.created_at,
+    }))
+    selectedResult.value = null
+    inspectorOpen.value = false
+    sidebarOpen.value = false
+    await scrollToBottom()
+  } catch (cause) {
+    showError(cause)
+  } finally {
+    loadingConversation.value = false
+  }
+}
+
+function startNewConversation() {
+  activeId.value = null
+  messages.value = []
+  prompt.value = ''
+  selectedResult.value = null
+  sidebarOpen.value = false
+  inspectorOpen.value = false
+  error.value = ''
+}
+
+async function removeConversation(item: ConversationSummary) {
+  if (loading.value || deletingConversationId.value) return
+  if (!window.confirm(`删除会话“${item.title}”？此操作无法撤销。`)) return
+
+  deletingConversationId.value = item.id
+  error.value = ''
+  try {
+    await deleteConversation(item.id, userId)
+    const wasActive = activeId.value === item.id
+    conversations.value = conversations.value.filter((conversation) => conversation.id !== item.id)
+    if (wasActive) {
+      startNewConversation()
+      const nextConversation = conversations.value[0]
+      if (nextConversation) await selectConversation(nextConversation.id)
+    }
+  } catch (cause) {
+    showError(cause)
+  } finally {
+    deletingConversationId.value = null
+  }
+}
+
+async function submit() {
+  const content = prompt.value.trim()
+  if (!content || loading.value) return
+
+  loading.value = true
+  error.value = ''
+  prompt.value = ''
+  const optimisticId = `local-${Date.now()}`
+  messages.value.push({
+    id: optimisticId,
+    role: 'user',
+    content,
+    createdAt: new Date().toISOString(),
+  })
+  await scrollToBottom()
+
+  try {
+    let conversationId = activeId.value
+    if (!conversationId) {
+      const created = await createConversation(userId, makeTitle(content))
+      conversations.value.unshift(created)
+      activeId.value = created.id
+      conversationId = created.id
+    }
+
+    const result = await sendChat(
+      conversationId,
+      userId,
+      content,
+      selectedModelId.value || undefined,
+    )
+    messages.value.push({
+      id: result.message_id,
+      role: 'assistant',
+      content: result.content,
+      createdAt: new Date().toISOString(),
+      result,
+    })
+    selectedResult.value = result
+    if (window.innerWidth >= 1180) inspectorOpen.value = true
+    const current = conversations.value.find((item) => item.id === conversationId)
+    if (current) current.updated_at = new Date().toISOString()
+  } catch (cause) {
+    messages.value = messages.value.filter((message) => message.id !== optimisticId)
+    prompt.value = content
+    showError(cause)
+  } finally {
+    loading.value = false
+    await scrollToBottom()
+  }
+}
+
+function openInspector(result?: ChatResult) {
+  if (!result) return
+  selectedResult.value = result
+  inspectorOpen.value = true
+}
+
+function openModelSettings() {
+  inspectorOpen.value = false
+  modelSettingsOpen.value = true
+  modelFormOpen.value = false
+  modelError.value = ''
+}
+
+function chooseModel(id: string) {
+  selectedModelId.value = id
+  persistSelectedModel()
+}
+
+function beginCreateModel() {
+  editingModelId.value = null
+  modelForm.value = newModelForm()
+  modelFormOpen.value = true
+  modelError.value = ''
+}
+
+function beginEditModel(item: ModelConfig) {
+  editingModelId.value = item.id
+  modelForm.value = {
+    name: item.name,
+    provider: item.provider,
+    model: item.model,
+    base_url: item.base_url,
+    api_key: '',
+    max_tokens: item.max_tokens,
+    temperature: item.temperature,
+    is_default: item.is_default,
+  }
+  modelFormOpen.value = true
+  modelError.value = ''
+}
+
+async function saveModel() {
+  if (modelSaving.value) return
+  modelSaving.value = true
+  modelError.value = ''
+  try {
+    const payload: Partial<ModelConfigInput> = { ...modelForm.value }
+    if (editingModelId.value && !modelForm.value.api_key) delete payload.api_key
+    const saved = editingModelId.value
+      ? await updateModel(editingModelId.value, payload)
+      : await createModel(modelForm.value)
+    await loadModels()
+    chooseModel(saved.id)
+    modelFormOpen.value = false
+  } catch (cause) {
+    modelError.value = cause instanceof Error ? cause.message : '模型配置保存失败'
+  } finally {
+    modelSaving.value = false
+  }
+}
+
+async function removeModel(item: ModelConfig) {
+  if (!window.confirm(`停用模型“${item.name}”？`)) return
+  modelError.value = ''
+  try {
+    await deleteModel(item.id)
+    await loadModels()
+  } catch (cause) {
+    modelError.value = cause instanceof Error ? cause.message : '模型配置删除失败'
+  }
+}
+
+function onComposerKeydown(event: KeyboardEvent) {
+  if (event.key === 'Enter' && !event.shiftKey) {
+    event.preventDefault()
+    void submit()
+  }
+}
+
+function formatTime(value: string) {
+  return new Intl.DateTimeFormat('zh-CN', {
+    month: 'short',
+    day: 'numeric',
+    hour: '2-digit',
+    minute: '2-digit',
+  }).format(new Date(value))
+}
+
+function formatArguments(value: Record<string, unknown>) {
+  return JSON.stringify(value, null, 2)
+}
+
+function makeTitle(content: string) {
+  return content.length > 28 ? `${content.slice(0, 28)}…` : content
+}
+
+function newModelForm(): ModelForm {
+  return {
+    name: 'DeepSeek Chat',
+    provider: 'deepseek-official',
+    model: 'deepseek-chat',
+    base_url: 'https://api.deepseek.com',
+    api_key: '',
+    max_tokens: 4096,
+    temperature: 0.2,
+    is_default: models.value.length === 0,
+  }
+}
+
+function persistSelectedModel() {
+  if (selectedModelId.value) {
+    localStorage.setItem('medical-agent-model-id', selectedModelId.value)
+  } else {
+    localStorage.removeItem('medical-agent-model-id')
+  }
+}
+
+function showError(cause: unknown) {
+  error.value = cause instanceof Error ? cause.message : '服务暂时不可用，请稍后重试。'
+}
+
+function getUserId() {
+  const key = 'medical-agent-user-id'
+  const existing = localStorage.getItem(key)
+  if (existing) return existing
+  const created = `web-${crypto.randomUUID()}`
+  localStorage.setItem(key, created)
+  return created
+}
+
+async function scrollToBottom() {
+  await nextTick()
+  messageList.value?.scrollTo({ top: messageList.value.scrollHeight, behavior: 'smooth' })
+}
 </script>
-<template><div class="app"><aside><div class="logo">A<span>/</span>01</div><button class="new">＋ 新对话</button><p class="nav-label">今天</p><a class="chat active">急性脑出血降压目标</a><a class="chat">抗凝相关脑出血逆转</a><p class="nav-label">较早</p><a class="chat">外科手术适应证</a><footer>循证问答 Agent<br><span>所有引用均可回溯</span></footer></aside><main><header><div><span class="pulse"></span> 3 个证据服务已连接</div><div class="model">DEEPSEEK · CHAT⌄</div></header><section class="conversation"><p class="kicker">Clinical evidence dialogue</p><h1>急性脑出血患者的<br>血压应该降到多少？</h1><article class="answer"><div class="answer-label">循证回答 <span>3 项来源</span></div><p>对于发病 6 小时内、收缩压 150–220 mmHg 且无降压禁忌的患者，将收缩压平稳降至约 140 mmHg 并维持在 130–150 mmHg 通常是安全的，可能改善功能结局。应避免快速降至 130 mmHg 以下。<sup>[1]</sup></p><div class="cite"><b>[1]</b><span>中国脑出血诊治指南（2024）<small>第 18 页 · 推荐意见 4 · 已审核</small></span><button>查看证据</button></div></article><div class="trace"><p class="kicker">本次运行轨迹</p><div v-for="item in traces" :key="item[0]"><b>{{item[0]}}</b><span>{{item[1]}}</span><em>{{item[2]}}</em></div></div></section><div class="composer"><textarea v-model="prompt" placeholder="继续追问治疗建议、证据强度或适用人群…"></textarea><button :disabled="!prompt.trim()">发送 ↑</button><small>医学回答仅供专业参考；关键决策请结合患者实际情况。</small></div></main></div></template>
+
+<template>
+  <div class="shell" :class="{ 'has-inspector': inspectorOpen }">
+    <button
+      v-if="sidebarOpen || inspectorOpen || modelSettingsOpen"
+      class="backdrop"
+      :class="{ 'model-open': modelSettingsOpen }"
+      aria-label="关闭面板"
+      @click="sidebarOpen = false; inspectorOpen = false; modelSettingsOpen = false"
+    />
+
+    <aside class="sidebar" :class="{ open: sidebarOpen }">
+      <div class="brand">
+        <span class="brand-mark" aria-hidden="true">
+          <svg class="brand-glyph" viewBox="0 0 26 12" focusable="false">
+            <path d="M0 0h2v12H0zM12 0H6C4.9 0 4 .9 4 2v8c0 1.1.9 2 2 2h6v-2H6V2h6zM15 0h2v5h7V0h2v12h-2V7h-7v5h-2z" />
+          </svg>
+        </span>
+        <div><strong>循证医学平台</strong><small>ICH EVIDENCE OS</small></div>
+      </div>
+
+      <div class="platform-switcher" role="navigation" aria-label="平台应用切换">
+        <a href="/knowledge/">知识空间</a>
+        <a class="active" href="/agent/" aria-current="page">智能问答</a>
+        <a href="/evaluation/">评测中心</a>
+      </div>
+
+      <button class="new-chat" type="button" @click="startNewConversation">
+        <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 5v14M5 12h14" /></svg>
+        新建对话
+      </button>
+
+      <nav aria-label="会话历史">
+        <div class="nav-heading"><span>近期会话</span><b>{{ conversations.length }}</b></div>
+        <p v-if="!conversations.length" class="nav-empty">发送第一条问题后，会话将保存在这里。</p>
+        <div
+          v-for="conversation in conversations"
+          :key="conversation.id"
+          class="conversation-row"
+          :class="{ active: activeId === conversation.id }"
+        >
+          <button class="conversation-link" type="button" @click="selectConversation(conversation.id)">
+            <span>{{ conversation.title }}</span>
+            <time>{{ formatTime(conversation.updated_at) }}</time>
+          </button>
+          <button
+            class="conversation-delete"
+            type="button"
+            :disabled="deletingConversationId === conversation.id"
+            :aria-label="`删除会话：${conversation.title}`"
+            title="删除会话"
+            @click="removeConversation(conversation)"
+          >
+            <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M5 7h14M9 7V4h6v3m2 0-1 13H8L7 7m4 4v5m2-5v5" /></svg>
+          </button>
+        </div>
+      </nav>
+
+      <footer class="sidebar-footer">
+        <span class="status-dot" :class="{ online }" />
+        <div><strong>{{ online ? 'Agent 服务在线' : 'Agent 服务离线' }}</strong><small>所有医学结论需经临床复核</small></div>
+      </footer>
+    </aside>
+
+    <main class="workspace">
+      <header class="topbar">
+        <button class="icon-button mobile-only" type="button" aria-label="打开会话列表" @click="sidebarOpen = true">
+          <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 7h16M4 12h16M4 17h10" /></svg>
+        </button>
+        <div class="context">
+          <span>当前会话</span>
+          <strong>{{ activeConversation?.title || '新对话' }}</strong>
+        </div>
+        <div class="topbar-actions">
+          <button class="model-label" type="button" aria-label="配置模型" @click="openModelSettings">
+            <i /> {{ activeModelLabel }}
+            <svg viewBox="0 0 24 24" aria-hidden="true"><path d="m7 10 5 5 5-5" /></svg>
+          </button>
+          <button
+            class="trace-button"
+            type="button"
+            :disabled="!selectedResult"
+            @click="inspectorOpen = !inspectorOpen"
+          >
+            运行详情
+            <span v-if="selectedResult">{{ toolCalls.length }}</span>
+          </button>
+        </div>
+      </header>
+
+      <section ref="messageList" class="message-list" aria-live="polite">
+        <div v-if="loadingConversation" class="loading-history">正在读取会话…</div>
+
+        <div v-else-if="!messages.length" class="welcome">
+          <p class="eyebrow">Evidence first · Clinical reasoning</p>
+          <h1>从一个临床问题开始。</h1>
+          <p>Agent 会按需检索知识库，保留工具调用记录，并明确标记未经文献验证的内容。</p>
+          <div class="suggestions" aria-label="示例问题">
+            <button type="button" @click="prompt = '急性脑出血患者的血压管理目标是什么？'">急性期血压管理</button>
+            <button type="button" @click="prompt = '抗凝相关脑出血应如何进行逆转治疗？'">抗凝药物逆转</button>
+            <button type="button" @click="prompt = '脑出血患者外科手术的适应证有哪些？'">外科手术适应证</button>
+          </div>
+        </div>
+
+        <div v-else class="thread">
+          <article
+            v-for="message in messages"
+            :key="message.id"
+            class="message"
+            :class="message.role"
+          >
+            <div class="message-meta">
+              <span>{{ message.role === 'user' ? '你的问题' : '循证回答' }}</span>
+              <time>{{ formatTime(message.createdAt) }}</time>
+            </div>
+            <p>{{ message.content }}</p>
+            <div v-if="message.result" class="answer-meta">
+              <span v-if="message.result.degraded_without_evidence" class="warning-chip">证据不足</span>
+              <span v-else-if="message.result.citations.length" class="verified-chip">引用已核验</span>
+              <span v-else class="neutral-chip">无需检索</span>
+              <span>{{ message.result.model }}</span>
+              <button type="button" @click="openInspector(message.result)">
+                {{ message.result.tool_calls.length }} 次工具调用
+                <svg viewBox="0 0 24 24" aria-hidden="true"><path d="m9 18 6-6-6-6" /></svg>
+              </button>
+            </div>
+          </article>
+
+          <article v-if="loading" class="message assistant pending">
+            <div class="message-meta"><span>Agent 正在工作</span></div>
+            <div class="thinking"><i /><i /><i /></div>
+            <small>正在判断是否需要调用医学证据工具…</small>
+          </article>
+        </div>
+      </section>
+
+      <div class="composer-wrap">
+        <p v-if="error" class="error-banner" role="alert">
+          <span>{{ error }}</span><button type="button" @click="error = ''">关闭</button>
+        </p>
+        <form class="composer" @submit.prevent="submit">
+          <textarea
+            v-model="prompt"
+            rows="1"
+            :disabled="loading"
+            aria-label="输入医学问题"
+            placeholder="询问治疗建议、证据强度或适用人群…"
+            @keydown="onComposerKeydown"
+          />
+          <button class="send-button" type="submit" :disabled="!prompt.trim() || loading" aria-label="发送">
+            <svg viewBox="0 0 24 24" aria-hidden="true"><path d="m5 12 14-7-4 14-3-6-7-1Z" /></svg>
+          </button>
+        </form>
+        <small class="disclaimer">回答仅供专业参考，不替代医生诊断与治疗决策。</small>
+      </div>
+    </main>
+
+    <aside class="inspector" :class="{ open: inspectorOpen }" aria-label="运行详情">
+      <div class="inspector-header">
+        <div><span>Run inspector</span><strong>运行详情</strong></div>
+        <button class="icon-button" type="button" aria-label="关闭运行详情" @click="inspectorOpen = false">
+          <svg viewBox="0 0 24 24" aria-hidden="true"><path d="m6 6 12 12M18 6 6 18" /></svg>
+        </button>
+      </div>
+
+      <template v-if="selectedResult">
+        <dl class="run-summary">
+          <div><dt>状态</dt><dd :class="selectedResult.degraded_without_evidence ? 'warn' : 'success'">{{ selectedResult.degraded_without_evidence ? '证据不足' : '已完成' }}</dd></div>
+          <div><dt>模型</dt><dd>{{ selectedResult.model }}</dd></div>
+          <div><dt>证据引用</dt><dd>{{ evidenceCount }}</dd></div>
+          <div><dt>工具调用</dt><dd>{{ toolCalls.length }}</dd></div>
+        </dl>
+
+        <div class="inspector-section">
+          <div class="section-title"><span>执行轨迹</span><b>{{ toolCalls.length }}</b></div>
+          <p v-if="!toolCalls.length" class="inspector-empty">本轮没有执行工具，回答已标记为未经文献验证。</p>
+          <details v-for="(call, index) in toolCalls" :key="`${call.server}-${call.tool}-${index}`" class="tool-call">
+            <summary>
+              <i :class="{ failed: call.is_error }">{{ index + 1 }}</i>
+              <span><strong>{{ call.tool }}</strong><small>{{ call.server }} · {{ call.latency_ms }} ms</small></span>
+              <svg viewBox="0 0 24 24" aria-hidden="true"><path d="m7 10 5 5 5-5" /></svg>
+            </summary>
+            <pre>{{ formatArguments(call.arguments) }}</pre>
+          </details>
+        </div>
+
+        <div class="inspector-section">
+          <div class="section-title"><span>溯源标识</span></div>
+          <code>{{ selectedResult.run_id }}</code>
+        </div>
+      </template>
+      <p v-else class="inspector-empty">完成一次问答后，可在这里查看模型、工具和证据状态。</p>
+    </aside>
+
+    <aside class="model-settings" :class="{ open: modelSettingsOpen }" aria-label="模型配置">
+      <div class="inspector-header">
+        <div><span>Model registry</span><strong>模型配置</strong></div>
+        <button class="icon-button" type="button" aria-label="关闭模型配置" @click="modelSettingsOpen = false">
+          <svg viewBox="0 0 24 24" aria-hidden="true"><path d="m6 6 12 12M18 6 6 18" /></svg>
+        </button>
+      </div>
+
+      <template v-if="!modelFormOpen">
+        <p class="settings-help">选择本轮问答使用的模型。未添加配置时，系统继续使用服务端环境变量。</p>
+        <button
+          class="model-option environment"
+          :class="{ selected: !selectedModelId }"
+          type="button"
+          @click="chooseModel('')"
+        >
+          <i /><span><strong>环境默认模型</strong><small>由服务端 .env 管理</small></span>
+          <b>{{ !selectedModelId ? '使用中' : '' }}</b>
+        </button>
+
+        <div class="model-list">
+          <div v-for="item in models" :key="item.id" class="model-row" :class="{ selected: item.id === selectedModelId }">
+            <button type="button" class="model-option" @click="chooseModel(item.id)">
+              <i /><span><strong>{{ item.name }}</strong><small>{{ item.provider }} · {{ item.model }}</small></span>
+              <b>{{ item.id === selectedModelId ? '使用中' : item.is_default ? '默认' : '' }}</b>
+            </button>
+            <div class="model-actions">
+              <button type="button" @click="beginEditModel(item)">编辑</button>
+              <button type="button" class="danger" @click="removeModel(item)">停用</button>
+            </div>
+          </div>
+        </div>
+
+        <p v-if="modelError" class="form-error" role="alert">{{ modelError }}</p>
+        <button class="add-model" type="button" @click="beginCreateModel">＋ 添加模型连接</button>
+      </template>
+
+      <form v-else class="model-form" @submit.prevent="saveModel">
+        <button class="form-back" type="button" @click="modelFormOpen = false">← 返回模型列表</button>
+        <label>配置名称<input v-model.trim="modelForm.name" required maxlength="100" placeholder="例如：DeepSeek Chat" /></label>
+        <label>Harness Provider<input v-model.trim="modelForm.provider" required maxlength="100" placeholder="deepseek-official" /></label>
+        <label>模型名称<input v-model.trim="modelForm.model" required maxlength="255" placeholder="deepseek-chat" /></label>
+        <label>API 地址<input v-model.trim="modelForm.base_url" required type="url" maxlength="500" placeholder="https://api.deepseek.com" /></label>
+        <label>
+          API Key
+          <input v-model="modelForm.api_key" type="password" autocomplete="new-password" :placeholder="editingModelId ? '留空表示保留原密钥' : '可留空并使用环境变量密钥'" />
+        </label>
+        <div class="form-grid">
+          <label>最大输出<input v-model.number="modelForm.max_tokens" required type="number" min="1" max="131072" /></label>
+          <label>温度<input v-model.number="modelForm.temperature" required type="number" min="0" max="2" step="0.1" /></label>
+        </div>
+        <label class="check-row"><input v-model="modelForm.is_default" type="checkbox" /><span>设为默认模型</span></label>
+        <p class="secret-note">密钥由后端加密保存，前端无法再次读取。</p>
+        <p v-if="modelError" class="form-error" role="alert">{{ modelError }}</p>
+        <button class="save-model" type="submit" :disabled="modelSaving">
+          {{ modelSaving ? '正在保存…' : editingModelId ? '保存修改' : '添加并使用' }}
+        </button>
+      </form>
+    </aside>
+  </div>
+</template>

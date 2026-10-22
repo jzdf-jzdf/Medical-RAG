@@ -1,3 +1,5 @@
+"""API contracts for literature entries and their PDF/Markdown attachments."""
+
 import uuid
 from datetime import datetime
 
@@ -27,6 +29,8 @@ class DocumentFileRead(BaseModel):
 
     id: uuid.UUID
     original_name: str
+    kind: str
+    source: str
     media_type: str
     size_bytes: int
     created_at: datetime

@@ -1,3 +1,5 @@
+"""Document-entry APIs, attachment lifecycle, and PDF-to-Markdown conversion."""
+
 import asyncio
 import re
 import uuid
@@ -9,14 +11,16 @@ from typing import Any
 from fastapi import APIRouter, Depends, File, HTTPException, Query, UploadFile, status
 from fastapi.responses import FileResponse
 from pypdf import PdfReader
-from pypdf.errors import PdfReadError
+from pypdf.errors import DependencyError, PyPdfError
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.config import get_settings
 from app.db.session import get_db
-from app.models import Document
+from app.models import Document, ProcessingTask
 from app.repositories.documents import DocumentRepository
+from app.repositories.processing_tasks import ProcessingTaskRepository
+from app.schemas.dashboard import ProcessingTaskRead
 from app.schemas.documents import (
     AttachmentMove,
     DocumentCreate,
@@ -51,6 +55,12 @@ def _title_from_filename(filename: str) -> str:
     return " ".join(title.split()) or "未命名文献"
 
 
+def _entry_title_from_filename(filename: str) -> str:
+    """Use the uploaded filename as the stable default identity of a new entry."""
+
+    return Path(filename).stem.strip() or "未命名文献"
+
+
 def _safe_storage_path(storage_path: str) -> Path:
     root = settings.workspace_root.resolve()
     path = (root / storage_path).resolve()
@@ -59,7 +69,13 @@ def _safe_storage_path(storage_path: str) -> Path:
     return path
 
 
+def _file_kind(filename: str) -> str:
+    return "markdown" if Path(filename).suffix.lower() == ".md" else "pdf"
+
+
 async def _store_file(file: UploadFile) -> StoredUpload:
+    """Stream an upload to content-addressed storage without loading it into memory."""
+
     original_name = Path(file.filename or "document").name
     suffix = Path(original_name).suffix.lower()
     media_type = ALLOWED_FILE_TYPES.get(suffix)
@@ -135,17 +151,25 @@ def _clean_doi(value: str) -> str:
 
 
 def _pdf_metadata(path: Path, filename: str) -> dict[str, Any]:
+    fallback = {
+        "title": _title_from_filename(filename),
+        "metadata": {"metadata_source": "filename", "metadata_extracted": False},
+    }
     try:
         reader = PdfReader(path)
         raw = reader.metadata or {}
         sample = "\n".join((page.extract_text() or "") for page in reader.pages[:3])
-    except (OSError, TypeError, ValueError, PdfReadError):
-        return {"title": _title_from_filename(filename), "metadata": {"metadata_source": "filename"}}
+    except (OSError, TypeError, ValueError, DependencyError, PyPdfError):
+        # Metadata recognition is best-effort. Unsupported encryption, optional
+        # PDF codecs, or malformed page content must not invalidate the upload.
+        return fallback
 
     raw_title = str(raw.get("/Title") or "").strip()
     title = raw_title if raw_title and raw_title.lower() not in {"untitled", "unknown"} else ""
     if not title:
-        candidates = [line.strip() for line in sample.splitlines()[:25] if 6 <= len(line.strip()) <= 300]
+        candidates = [
+            line.strip() for line in sample.splitlines()[:25] if 6 <= len(line.strip()) <= 300
+        ]
         title = next(
             (line for line in candidates if not DOI_PATTERN.search(line) and not line.isdigit()),
             _title_from_filename(filename),
@@ -217,6 +241,8 @@ async def _extract_metadata(upload: StoredUpload) -> dict[str, Any]:
 def _file_values(upload: StoredUpload) -> dict[str, object]:
     return {
         "original_name": upload.original_name,
+        "kind": _file_kind(upload.original_name),
+        "source": "upload",
         "storage_path": upload.storage_path,
         "sha256": upload.digest,
         "media_type": upload.media_type,
@@ -228,7 +254,7 @@ def _document_payload(upload: StoredUpload, extracted: dict[str, Any]) -> Docume
     metadata = dict(extracted.get("metadata") or {})
     metadata["import_mode"] = "file"
     return DocumentCreate(
-        title=extracted.get("title") or _title_from_filename(upload.original_name),
+        title=_entry_title_from_filename(upload.original_name),
         doi=extracted.get("doi"),
         authors=extracted.get("authors") or [],
         abstract=extracted.get("abstract"),
@@ -264,6 +290,24 @@ async def _reject_existing_files(
         raise HTTPException(status_code=409, detail="一个或多个文件已存在于文献库中")
 
 
+async def _reject_active_processing_task(
+    db: AsyncSession, document_id: uuid.UUID
+) -> None:
+    """Keep a Worker's input and output slots stable for its entire lifetime.
+
+    The Worker resolves the PDF when it starts and later replaces the Markdown
+    slot. Deleting, moving, or replacing either attachment during that window
+    could make the result target a different document state.
+    """
+
+    task = await ProcessingTaskRepository(db).active_for_resource(document_id)
+    if task:
+        raise HTTPException(
+            status_code=409,
+            detail="该文献正在执行后台处理，请等待任务完成后再修改或删除附件",
+        )
+
+
 @router.post("", response_model=DocumentRead, status_code=status.HTTP_201_CREATED)
 async def create_document(
     payload: DocumentCreate, db: AsyncSession = Depends(get_db)
@@ -290,22 +334,36 @@ async def create_document_from_file(
     return documents[0]
 
 
-@router.post(
-    "/from-files", response_model=list[DocumentRead], status_code=status.HTTP_201_CREATED
-)
+@router.post("/from-files", response_model=list[DocumentRead], status_code=status.HTTP_201_CREATED)
 async def create_documents_from_files(
     files: list[UploadFile] = File(...), db: AsyncSession = Depends(get_db)
 ) -> list[DocumentRead]:
     uploads = await _store_batch(files)
     repository = DocumentRepository(db)
     await _reject_existing_files(repository, uploads)
-    extracted = [await _extract_metadata(upload) for upload in uploads]
+    try:
+        extracted = [await _extract_metadata(upload) for upload in uploads]
+    except Exception:
+        # If a future extractor fails unexpectedly, do not leave orphan files in
+        # content-addressed storage before any database row has been committed.
+        for upload in uploads:
+            _remove_stored_upload(upload)
+        raise
     items = [
         (_document_payload(upload, metadata), _file_values(upload))
         for upload, metadata in zip(uploads, extracted, strict=True)
     ]
     try:
-        return await repository.create_many_with_files(items)
+        documents = await repository.create_many_with_files(items)
+        for index, (document, upload) in enumerate(zip(documents, uploads, strict=True)):
+            if _file_kind(upload.original_name) == "markdown":
+                documents[index] = await repository.set_markdown_version(
+                    document,
+                    storage_path=upload.storage_path,
+                    parser="upload",
+                    parser_version="1",
+                )
+        return documents
     except IntegrityError as exc:
         await db.rollback()
         for upload in uploads:
@@ -332,17 +390,31 @@ async def add_document_file(
 async def add_document_files(
     document_id: uuid.UUID,
     files: list[UploadFile] = File(...),
+    replace_existing: bool = Query(default=False),
     db: AsyncSession = Depends(get_db),
 ) -> DocumentRead:
+    """Attach at most one file of each kind, optionally replacing existing versions."""
+
     repository = DocumentRepository(db)
     document = await repository.get(document_id)
     if not document:
         raise HTTPException(status_code=404, detail="文献条目不存在")
+    await _reject_active_processing_task(db, document_id)
 
     uploads = await _store_batch(files)
+    kinds = [_file_kind(upload.original_name) for upload in uploads]
+    if len(set(kinds)) != len(kinds):
+        for upload in uploads:
+            _remove_stored_upload(upload)
+        raise HTTPException(status_code=409, detail="同一条目一次最多上传一个 PDF 和一个 MD")
     await _reject_existing_files(repository, uploads)
     try:
-        document = await repository.add_files(document, [_file_values(item) for item in uploads])
+        document, removed_paths = await repository.add_files(
+            document,
+            [_file_values(item) for item in uploads],
+            replace_existing=replace_existing,
+        )
+        _remove_storage_paths(removed_paths)
         extracted_items = [await _extract_metadata(upload) for upload in uploads]
         merged: dict[str, Any] = {"metadata": {}}
         for extracted in extracted_items:
@@ -350,12 +422,74 @@ async def add_document_files(
                 if not merged.get(field) and extracted.get(field):
                     merged[field] = extracted[field]
             merged["metadata"].update(extracted.get("metadata") or {})
-        return await repository.fill_missing_metadata(document, merged)
+        document = await repository.fill_missing_metadata(document, merged)
+        markdown = next(
+            (upload for upload in uploads if _file_kind(upload.original_name) == "markdown"), None
+        )
+        if markdown:
+            document = await repository.set_markdown_version(
+                document,
+                storage_path=markdown.storage_path,
+                parser="upload",
+                parser_version="1",
+            )
+        return document
+    except FileExistsError as exc:
+        await db.rollback()
+        for upload in uploads:
+            _remove_stored_upload(upload)
+        raise HTTPException(
+            status_code=409,
+            detail=f"{exc}；确认后可替代原文件",
+        ) from exc
     except IntegrityError as exc:
         await db.rollback()
         for upload in uploads:
             _remove_stored_upload(upload)
         raise HTTPException(status_code=409, detail="文件或识别出的 DOI 已存在") from exc
+
+
+@router.post(
+    "/{document_id}/convert-pdf",
+    response_model=ProcessingTaskRead,
+    status_code=status.HTTP_202_ACCEPTED,
+)
+async def convert_document_pdf(
+    document_id: uuid.UUID,
+    replace_existing: bool = Query(default=False),
+    db: AsyncSession = Depends(get_db),
+) -> ProcessingTask:
+    """Validate conversion preconditions, enqueue durable work, and return 202.
+
+    The request does not invoke MinerU. It records all user intent required by
+    the Worker, allowing processing to continue if the browser disconnects.
+    Duplicate concurrent requests resolve to the existing active queue row.
+    """
+
+    repository = DocumentRepository(db)
+    document = await repository.get(document_id)
+    if not document:
+        raise HTTPException(status_code=404, detail="文献条目不存在")
+    pdf_file = next((file for file in document.files if file.kind == "pdf"), None)
+    if pdf_file is None:
+        raise HTTPException(status_code=409, detail="该条目没有可转换的 PDF 文件")
+    if any(file.kind == "markdown" for file in document.files) and not replace_existing:
+        raise HTTPException(
+            status_code=409,
+            detail="该条目已经有 MD 文件，MinerU 转换结果会替代现有 MD，请确认后继续",
+        )
+
+    # Fail before enqueue when the database row points to a missing physical
+    # input; otherwise the UI would briefly show an avoidable queued task.
+    pdf_path = _safe_storage_path(pdf_file.storage_path)
+    if not pdf_path.is_file():
+        raise HTTPException(status_code=404, detail="PDF 文件已丢失")
+    task, _created = await ProcessingTaskRepository(db).enqueue_pdf_conversion(
+        document_id=document.id,
+        document_name=document.title,
+        replace_existing=replace_existing,
+    )
+    return task
 
 
 @router.get("/attachments/{file_id}/content", response_class=FileResponse)
@@ -379,13 +513,12 @@ async def attachment_content(
 
 
 @router.delete("/attachments/{file_id}", status_code=status.HTTP_204_NO_CONTENT)
-async def delete_attachment(
-    file_id: uuid.UUID, db: AsyncSession = Depends(get_db)
-) -> None:
+async def delete_attachment(file_id: uuid.UUID, db: AsyncSession = Depends(get_db)) -> None:
     repository = DocumentRepository(db)
     attachment = await repository.get_file(file_id)
     if not attachment:
         raise HTTPException(status_code=404, detail="附件不存在")
+    await _reject_active_processing_task(db, attachment.document_id)
     storage_path = attachment.storage_path
     await repository.delete_file(attachment)
     _remove_storage_paths([storage_path])
@@ -401,10 +534,15 @@ async def move_attachment(
     attachment = await repository.get_file(file_id)
     if not attachment:
         raise HTTPException(status_code=404, detail="附件不存在")
+    await _reject_active_processing_task(db, attachment.document_id)
     target = await repository.get(payload.target_document_id)
     if not target:
         raise HTTPException(status_code=404, detail="目标条目不存在")
-    return await repository.move_file(attachment, target)
+    await _reject_active_processing_task(db, target.id)
+    try:
+        return await repository.move_file(attachment, target)
+    except FileExistsError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
 
 
 @router.get("/{document_id}", response_model=DocumentRead)
@@ -432,6 +570,15 @@ async def delete_document(document_id: uuid.UUID, db: AsyncSession = Depends(get
     document: Document | None = await repository.get(document_id)
     if not document:
         raise HTTPException(status_code=404, detail="文献条目不存在")
+    await _reject_active_processing_task(db, document_id)
+    knowledge_base_names = await repository.knowledge_base_names(document_id)
+    if knowledge_base_names:
+        names = "、".join(knowledge_base_names[:3])
+        suffix = "等" if len(knowledge_base_names) > 3 else ""
+        raise HTTPException(
+            status_code=409,
+            detail=f"该文献已加入知识库“{names}”{suffix}，请先从知识库中移除后再删除",
+        )
     storage_paths = [file.storage_path for file in document.files]
     await repository.delete(document)
     _remove_storage_paths(storage_paths)

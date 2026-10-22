@@ -1,10 +1,13 @@
+"""Database operations for literature entries and their file/version lifecycle."""
+
 import uuid
 
 from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 
-from app.models import Document, DocumentFile
+from app.models import Collection, Document, DocumentFile, DocumentVersion
+from app.models.associations import collection_documents
 from app.schemas.documents import DocumentCreate, DocumentUpdate
 
 
@@ -85,12 +88,30 @@ class DocumentRepository:
         return await self._get_required(document.id)
 
     async def add_files(
-        self, document: Document, files: list[dict[str, object]]
-    ) -> Document:
+        self,
+        document: Document,
+        files: list[dict[str, object]],
+        *,
+        replace_existing: bool = False,
+    ) -> tuple[Document, list[str]]:
+        # The unique constraint is the final guard. This preflight provides a useful
+        # conflict message and records paths that can be removed after commit.
+        incoming_kinds = {str(file_data["kind"]) for file_data in files}
+        existing = [file for file in document.files if file.kind in incoming_kinds]
+        if existing and not replace_existing:
+            labels = "、".join("MD" if file.kind == "markdown" else "PDF" for file in existing)
+            raise FileExistsError(f"该条目已包含 {labels} 文件")
+
+        removed_paths: list[str] = []
+        for file in existing:
+            removed_paths.append(file.storage_path)
+            await self.session.delete(file)
+        if existing:
+            await self.session.flush()
         for file_data in files:
             document.files.append(DocumentFile(**file_data))
-        await self.session.flush()
-        return document
+        await self.session.commit()
+        return await self._get_required(document.id), removed_paths
 
     async def file_exists(self, sha256: str) -> bool:
         statement = select(DocumentFile.id).where(DocumentFile.sha256 == sha256)
@@ -105,11 +126,79 @@ class DocumentRepository:
     async def get_file(self, file_id: uuid.UUID) -> DocumentFile | None:
         return await self.session.get(DocumentFile, file_id)
 
+    async def knowledge_base_names(self, document_id: uuid.UUID) -> list[str]:
+        """Return every knowledge base that currently protects this document."""
+
+        statement = (
+            select(Collection.name)
+            .join(
+                collection_documents,
+                collection_documents.c.collection_id == Collection.id,
+            )
+            .where(collection_documents.c.document_id == document_id)
+            .order_by(Collection.name)
+        )
+        return list((await self.session.scalars(statement)).all())
+
     async def delete_file(self, file: DocumentFile) -> None:
+        if file.kind == "markdown":
+            versions = list(
+                (
+                    await self.session.scalars(
+                        select(DocumentVersion).where(
+                            DocumentVersion.document_id == file.document_id,
+                            DocumentVersion.markdown_path == file.storage_path,
+                        )
+                    )
+                ).all()
+            )
+            # Version rows are audit records. Removing the active MD invalidates
+            # their file pointer but should not erase the parsing history itself.
+            for version in versions:
+                version.status = "superseded"
+                version.markdown_path = None
         await self.session.delete(file)
         await self.session.commit()
 
     async def move_file(self, file: DocumentFile, target: Document) -> Document:
+        if any(item.kind == file.kind for item in target.files):
+            label = "MD" if file.kind == "markdown" else "PDF"
+            raise FileExistsError(f"目标条目已经包含 {label} 文件")
+        if file.kind == "markdown":
+            source_versions = list(
+                (
+                    await self.session.scalars(
+                        select(DocumentVersion).where(
+                            DocumentVersion.document_id == file.document_id,
+                            DocumentVersion.markdown_path == file.storage_path,
+                        )
+                    )
+                ).all()
+            )
+            for version in source_versions:
+                version.status = "superseded"
+                version.markdown_path = None
+            target_versions = list(
+                (
+                    await self.session.scalars(
+                        select(DocumentVersion)
+                        .where(DocumentVersion.document_id == target.id)
+                        .order_by(DocumentVersion.version)
+                    )
+                ).all()
+            )
+            # Moving an MD creates a new active version under the destination
+            # entry while preserving the source entry's historical row.
+            self.session.add(
+                DocumentVersion(
+                    document_id=target.id,
+                    version=(target_versions[-1].version + 1) if target_versions else 1,
+                    parser="move",
+                    parser_version="1",
+                    status="ready",
+                    markdown_path=file.storage_path,
+                )
+            )
         file.document = target
         await self.session.commit()
         return await self._get_required(target.id)
@@ -120,7 +209,9 @@ class DocumentRepository:
         for field in ("title", "doi", "authors", "abstract", "publication_year"):
             value = extracted.get(field)
             current = getattr(document, field)
-            if value and (current is None or current == [] or (field == "title" and not current.strip())):
+            if value and (
+                current is None or current == [] or (field == "title" and not current.strip())
+            ):
                 setattr(document, field, value)
         metadata = dict(document.metadata_json or {})
         metadata.update(extracted.get("metadata", {}))
@@ -128,11 +219,44 @@ class DocumentRepository:
         await self.session.commit()
         return await self._get_required(document.id)
 
+    async def set_markdown_version(
+        self,
+        document: Document,
+        *,
+        storage_path: str,
+        parser: str,
+        parser_version: str,
+    ) -> Document:
+        versions = list(
+            (
+                await self.session.scalars(
+                    select(DocumentVersion)
+                    .where(DocumentVersion.document_id == document.id)
+                    .order_by(DocumentVersion.version)
+                )
+            ).all()
+        )
+        # Keep old version rows as provenance, but clear paths because a replaced
+        # physical Markdown file may be deleted after the transaction commits.
+        for version in versions:
+            version.status = "superseded"
+            version.markdown_path = None
+        self.session.add(
+            DocumentVersion(
+                document_id=document.id,
+                version=(versions[-1].version + 1) if versions else 1,
+                parser=parser,
+                parser_version=parser_version,
+                status="ready",
+                markdown_path=storage_path,
+            )
+        )
+        await self.session.commit()
+        return await self._get_required(document.id)
+
     async def get(self, document_id: uuid.UUID) -> Document | None:
         statement = (
-            select(Document)
-            .options(selectinload(Document.files))
-            .where(Document.id == document_id)
+            select(Document).options(selectinload(Document.files)).where(Document.id == document_id)
         )
         return await self.session.scalar(statement)
 

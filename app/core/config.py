@@ -15,6 +15,7 @@ class Settings(BaseSettings):
     agent_api_url: HttpUrl
     allowed_origins: list[str] = ["http://localhost:5175"]
     request_timeout_seconds: int = Field(default=120, ge=1, le=600)
+    evaluation_user_id: str = Field(default="evaluation-workbench", min_length=1)
 
     @field_validator("allowed_origins", mode="before")
     @classmethod

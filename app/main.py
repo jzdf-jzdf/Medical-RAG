@@ -4,8 +4,11 @@ from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from sqlalchemy import text
 
+from app.api.evaluation import router as evaluation_router
+from app.api.workbench import router as workbench_router
 from app.core.config import get_settings
 from app.db import engine
+from app.services.observability import instrument, metrics_app
 
 settings = get_settings()
 
@@ -24,6 +27,10 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+app.middleware("http")(instrument("medical-evaluation-api"))
+app.mount("/metrics", metrics_app())
+app.include_router(workbench_router, prefix="/api/v1")
+app.include_router(evaluation_router, prefix="/api/v1")
 
 
 @app.get("/health", tags=["health"])

@@ -1,15 +1,18 @@
 <script setup lang="ts">
 import DOMPurify from 'dompurify'
 import { marked } from 'marked'
-import { computed, nextTick, onMounted, reactive, ref } from 'vue'
+import { computed, nextTick, onBeforeUnmount, onMounted, reactive, ref } from 'vue'
+import { useRoute, useRouter } from 'vue-router'
 
-type Tab = 'welcome' | 'documents' | 'knowledge' | 'tasks'
+type Tab = 'welcome' | 'documents' | 'configurations' | 'knowledge' | 'tasks'
 type NavigationTab = Exclude<Tab, 'welcome'>
 type NoticeKind = 'success' | 'error' | 'info'
 
 interface Attachment {
   id: string
   name: string
+  kind?: 'pdf' | 'markdown'
+  source?: 'upload' | 'mineru' | string
   mediaType: string
   sizeBytes: number
   createdAt?: string
@@ -38,6 +41,8 @@ interface ApiDocument {
   files: Array<{
     id: string
     original_name: string
+    kind: 'pdf' | 'markdown'
+    source: string
     media_type: string
     size_bytes: number
     created_at: string
@@ -45,58 +50,157 @@ interface ApiDocument {
   created_at: string
 }
 
-const apiBase = import.meta.env.VITE_API_BASE_URL || '/api/knowledge'
-const activeTab = ref<Tab>('welcome')
+interface ChunkingMethod {
+  id: string
+  name: string
+  strategy: string
+  description?: string
+  color: string
+  config: Record<string, unknown>
+  created_at: string
+}
+
+interface EmbeddingModel {
+  id: string
+  name: string
+  provider: string
+  model_name: string
+  dimension?: number
+  base_url?: string
+  config: Record<string, unknown>
+  created_at: string
+}
+
+interface ApiKnowledgeBase {
+  id: string
+  name: string
+  description?: string
+  status: string
+  chunking_method: ChunkingMethod
+  embedding_model: EmbeddingModel
+  documents: ApiDocument[]
+  created_at: string
+  updated_at: string
+}
+
+interface KnowledgeBase extends Omit<ApiKnowledgeBase, 'chunking_method' | 'embedding_model' | 'documents'> {
+  chunkingMethod: ChunkingMethod
+  embeddingModel: EmbeddingModel
+  documents: LibraryEntry[]
+}
+
+interface ChunkPreviewItem {
+  index: number
+  content: string
+  embedding_text: string
+  char_start: number
+  char_end: number
+  char_count: number
+  heading_path: string[]
+}
+
+interface ChunkPreviewStats {
+  total: number
+  average_chars: number
+  minimum_chars: number
+  maximum_chars: number
+  too_short: number
+  too_long: number
+}
+
+interface DashboardDocument {
+  id: string
+  title: string
+  item_type: string
+  attachment_count: number
+  chunk_count: number
+  has_pdf: boolean
+  has_markdown: boolean
+  created_at: string
+}
+
+interface DashboardData {
+  documents_total: number
+  documents_this_week: number
+  markdown_ready: number
+  knowledge_bases: number
+  persisted_chunks: number
+  recent_documents: DashboardDocument[]
+}
+
+/**
+ * Normalized activity returned by the backend task timeline.
+ * A UUID id denotes a retryable durable Worker row; synthetic history records
+ * use string ids. Null progress is an explicit indeterminate state.
+ */
+interface ProcessingTask {
+  id: string
+  resource_id: string
+  resource_type: 'document' | 'knowledge_base' | 'embedding_model'
+  name: string
+  operation: string
+  processor: string
+  status: string
+  phase: string
+  progress: number | null
+  message?: string
+  error_message?: string
+  attempt_count: number
+  max_attempts: number
+  created_at: string
+  started_at?: string
+  finished_at?: string
+  updated_at?: string
+}
+
+interface KnowledgeSearchHit {
+  chunk_id: string
+  document_id: string
+  document_title: string
+  content: string
+  heading_path: string[]
+  score: number
+  citation: { title: string; heading?: string; pages?: Array<number | null> }
+}
+
+// Vite proxies this stable prefix to the knowledge API in development. Keeping
+// API paths relative also allows the production site to live below /knowledge/.
+const apiBase = '/api/knowledge'
+
+// The welcome page is deliberately absent from the sidebar. Clicking the brand
+// is the single, predictable way to return to it.
+const route = useRoute()
+const router = useRouter()
+const tabPaths: Record<Tab, string> = {
+  welcome: '/',
+  documents: '/documents',
+  configurations: '/configurations',
+  knowledge: '/knowledge-bases',
+  tasks: '/tasks',
+}
+const activeTab = computed<Tab>(() => {
+  const routeName = String(route.name || 'welcome')
+  return (['documents', 'configurations', 'knowledge', 'tasks'].includes(routeName)
+    ? routeName
+    : 'welcome') as Tab
+})
+// Navigation and service reachability are independent: routes remain usable so
+// an offline API can show explicit recovery states instead of a blank screen.
 const serviceState = ref<'checking' | 'online' | 'offline'>('checking')
-const tabs: Array<{ id: NavigationTab; label: string; hint: string }> = [
-  { id: 'documents', label: '文献管理', hint: '24' },
-  { id: 'knowledge', label: '知识库管理', hint: '06' },
-  { id: 'tasks', label: '解析任务', hint: '03' },
+const tabs: Array<{ id: NavigationTab; label: string; path: string }> = [
+  { id: 'documents', label: '文献管理', path: tabPaths.documents },
+  { id: 'configurations', label: '模型注册', path: tabPaths.configurations },
+  { id: 'knowledge', label: '知识库管理', path: tabPaths.knowledge },
+  { id: 'tasks', label: '解析任务', path: tabPaths.tasks },
 ]
 
-const recentDocuments = [
-  { title: '中国脑出血诊治指南（2024）', meta: '指南 · 142 个知识块', state: '已审核' },
-  { title: '急性脑出血血压管理循证更新', meta: '系统综述 · 86 个知识块', state: '解析完成' },
-  { title: '自发性脑出血外科治疗进展', meta: '综述 · 64 个知识块', state: '待审核' },
-]
-
-const sampleEntries: LibraryEntry[] = [
-  {
-    id: 'sample-1',
-    title: '中国脑出血诊治指南（2024）',
-    itemType: 'guideline',
-    authors: ['中华医学会神经病学分会', '中华医学会神经外科学分会'],
-    year: 2024,
-    doi: '10.3760/cma.j.cn113694-20240118-00042',
-    abstract: '围绕自发性脑出血的院前处理、急诊评估、内外科治疗及康复管理形成循证推荐。',
-    attachments: [
-      { id: 'file-1', name: '中国脑出血诊治指南_2024.pdf', mediaType: 'application/pdf', sizeBytes: 8_934_112 },
-      { id: 'file-2', name: '指南补充材料.pdf', mediaType: 'application/pdf', sizeBytes: 1_642_005 },
-    ],
-  },
-  {
-    id: 'sample-2',
-    title: '急性脑出血血压管理循证更新',
-    itemType: 'journalArticle',
-    authors: ['王宁', '李睿', '周峰'],
-    year: 2025,
-    attachments: [
-      { id: 'file-3', name: 'ICH_血压管理循证更新.pdf', mediaType: 'application/pdf', sizeBytes: 4_268_314 },
-    ],
-  },
-  {
-    id: 'sample-3',
-    title: '自发性脑出血外科治疗进展',
-    itemType: 'journalArticle',
-    authors: ['陈宇', '许博'],
-    year: 2025,
-    attachments: [],
-  },
-]
-
-const entries = ref<LibraryEntry[]>(sampleEntries)
-const selectedEntryId = ref<string | null>(sampleEntries[0].id)
-const expandedEntryIds = ref<Set<string>>(new Set([sampleEntries[0].id]))
+// API-backed collections start empty so an unavailable service can never expose
+// sample records that look like persisted medical literature.
+const entries = ref<LibraryEntry[]>([])
+const selectedEntryId = ref<string | null>(null)
+const expandedEntryIds = ref<Set<string>>(new Set())
+const isEntriesLoading = ref(true)
+const entriesLoadError = ref('')
 const searchQuery = ref('')
 const itemFilter = ref('all')
 const isCreateDialogOpen = ref(false)
@@ -116,9 +220,54 @@ const movingAttachment = ref<Attachment | null>(null)
 const moveTargetId = ref<string>('')
 const isMoving = ref(false)
 const deletingAttachmentId = ref<string | null>(null)
+const convertingDocumentId = ref<string | null>(null)
 const isDeletingEntry = ref(false)
 const titleInput = ref<HTMLInputElement | null>(null)
 const notice = ref<{ kind: NoticeKind; message: string } | null>(null)
+const chunkingMethods = ref<ChunkingMethod[]>([])
+const embeddingModels = ref<EmbeddingModel[]>([])
+const knowledgeBases = ref<KnowledgeBase[]>([])
+const isConfigurationsLoading = ref(true)
+const configurationsLoadError = ref('')
+const isKnowledgeBasesLoading = ref(true)
+const knowledgeBasesLoadError = ref('')
+const dashboard = ref<DashboardData | null>(null)
+const isDashboardLoading = ref(true)
+const dashboardLoadError = ref('')
+
+// Task records are always server-backed. The timer is deliberately kept outside
+// Vue reactivity because it is only a scheduling handle, not renderable state.
+const tasks = ref<ProcessingTask[]>([])
+const isTasksLoading = ref(true)
+const tasksLoadError = ref('')
+const selectedTaskIds = ref<Set<string>>(new Set())
+const deletingTaskIds = ref<Set<string>>(new Set())
+let taskPollTimer: ReturnType<typeof setTimeout> | null = null
+const isSavingChunkingMethod = ref(false)
+const isSavingEmbeddingModel = ref(false)
+const deletingConfigurationId = ref<string | null>(null)
+const isChunkingDialogOpen = ref(false)
+const chunkingStep = ref(1)
+const chunkingPreviewDocumentId = ref('')
+const chunkingPreview = ref<ChunkPreviewItem[]>([])
+const chunkingPreviewStats = ref<ChunkPreviewStats | null>(null)
+const chunkingPreviewError = ref('')
+const isChunkingPreviewLoading = ref(false)
+const chunkingPreviewSignature = ref('')
+const isEmbeddingDialogOpen = ref(false)
+const isKnowledgeDialogOpen = ref(false)
+const isSavingKnowledgeBase = ref(false)
+const selectedKnowledgeBase = ref<KnowledgeBase | null>(null)
+const selectedKnowledgeDocument = ref<LibraryEntry | null>(null)
+const chunkPreview = ref<ChunkPreviewItem[]>([])
+const isChunkPreviewLoading = ref(false)
+const chunkPreviewError = ref('')
+const downloadingModelId = ref<string | null>(null)
+const buildingKnowledgeBaseId = ref<string | null>(null)
+const knowledgeSearchQuery = ref('')
+const knowledgeSearchResults = ref<KnowledgeSearchHit[]>([])
+const knowledgeSearchError = ref('')
+const isKnowledgeSearching = ref(false)
 
 const createForm = reactive({
   title: '',
@@ -129,16 +278,38 @@ const createForm = reactive({
   abstract: '',
 })
 
-const libraries = [
-  { name: '脑出血临床指南库', detail: '12 篇文献 · 486 个知识块', tone: 'sage' },
-  { name: '急性期治疗证据库', detail: '8 篇文献 · 392 个知识块', tone: 'blue' },
-  { name: '外科与康复研究库', detail: '17 篇文献 · 406 个知识块', tone: 'peach' },
-]
-const tasks = [
-  { name: 'AHA/ASA 脑出血管理指南.pdf', parser: 'MinerU', progress: '82%', state: '解析中' },
-  { name: '微创手术随机对照研究.pdf', parser: 'Docling', progress: '100%', state: '待审核' },
-  { name: '院内病例资料扫描件.pdf', parser: 'OCR + MinerU', progress: '36%', state: '识别中' },
-]
+const chunkingForm = reactive({
+  name: '',
+  strategy: 'heading',
+  description: '',
+  color: '#5f918c',
+  targetChars: 800,
+  maxChars: 1200,
+  minChars: 200,
+  overlap: 120,
+  maxChunks: 2000,
+  headingLevels: [1, 2, 3, 4] as number[],
+  mergeShortSections: true,
+  prependHeadingPath: true,
+  preserveTables: true,
+  preserveCodeBlocks: true,
+})
+
+const embeddingForm = reactive({
+  name: 'MedCPT（本地双编码器）',
+  provider: 'medcpt',
+  modelName: 'ncbi/MedCPT-Article-Encoder',
+  dimension: 768 as number | undefined,
+  baseUrl: '',
+})
+
+const knowledgeForm = reactive({
+  name: '',
+  description: '',
+  documentIds: [] as string[],
+  chunkingMethodId: '',
+  embeddingModelId: '',
+})
 
 const filteredEntries = computed(() => {
   const query = searchQuery.value.trim().toLocaleLowerCase()
@@ -150,8 +321,32 @@ const filteredEntries = computed(() => {
 })
 
 const selectedEntry = computed(() => entries.value.find((entry) => entry.id === selectedEntryId.value) ?? null)
+// Only queued/running are Worker-owned active states. Knowledge-base "building"
+// entries are historical projections and currently do not drive this poller.
+const activeTasks = computed(() => tasks.value.filter((task) => ['queued', 'running'].includes(task.status)))
+const removableTasks = computed(() => tasks.value.filter(isRemovableTask))
+const allRemovableTasksSelected = computed(() => (
+  removableTasks.value.length > 0
+  && removableTasks.value.every((task) => selectedTaskIds.value.has(task.id))
+))
+const selectedEntryActiveTask = computed(() => (
+  selectedEntry.value ? activeTaskForDocument(selectedEntry.value.id) : undefined
+))
+const selectedEntryKnowledgeBases = computed(() => {
+  if (!selectedEntry.value) return []
+  // Knowledge-base membership protects the whole entry, including its physical
+  // PDF/MD files, so the inspector can explain why deletion is unavailable.
+  return knowledgeBases.value.filter((library) => (
+    library.documents.some((document) => document.id === selectedEntry.value?.id)
+  ))
+})
 const totalAttachments = computed(() => entries.value.reduce((total, entry) => total + entry.attachments.length, 0))
-const moveTargets = computed(() => entries.value.filter((entry) => entry.id !== selectedEntryId.value))
+const markdownReadyEntries = computed(() => entries.value.filter((entry) => entry.attachments.some((file) => attachmentKind(file) === 'MD')))
+const recentDocuments = computed(() => dashboard.value?.recent_documents ?? [])
+const moveTargets = computed(() => entries.value.filter((entry) => (
+  entry.id !== selectedEntryId.value
+  && (!movingAttachment.value || !entry.attachments.some((file) => attachmentKind(file) === attachmentKind(movingAttachment.value!)))
+)))
 
 function itemTypeLabel(type: string): string {
   return ({ journalArticle: '期刊论文', guideline: '临床指南', report: '报告', bookSection: '书籍章节', document: '文档' } as Record<string, string>)[type] || '文献条目'
@@ -168,6 +363,8 @@ function normalizeAuthor(author: string | Record<string, unknown>): string {
 }
 
 function mapApiDocument(document: ApiDocument): LibraryEntry {
+  // Convert snake_case transport fields once at the API boundary. Templates and
+  // interaction code can then use one predictable client-side domain shape.
   const metadata = document.metadata || {}
   return {
     id: document.id,
@@ -180,12 +377,126 @@ function mapApiDocument(document: ApiDocument): LibraryEntry {
     attachments: (document.files || []).map((file) => ({
       id: file.id,
       name: file.original_name,
+      kind: file.kind,
+      source: file.source,
       mediaType: file.media_type,
       sizeBytes: file.size_bytes,
       createdAt: file.created_at,
     })),
     createdAt: document.created_at,
   }
+}
+
+function mapKnowledgeBase(item: ApiKnowledgeBase): KnowledgeBase {
+  return {
+    id: item.id,
+    name: item.name,
+    description: item.description,
+    status: item.status,
+    chunkingMethod: item.chunking_method,
+    embeddingModel: item.embedding_model,
+    documents: item.documents.map(mapApiDocument),
+    created_at: item.created_at,
+    updated_at: item.updated_at,
+  }
+}
+
+function strategyLabel(strategy: string): string {
+  return ({ heading: '标题层级', recursive: '递归字符', fixed: '固定长度' } as Record<string, string>)[strategy] || strategy
+}
+
+function providerLabel(provider: string): string {
+  return ({ medcpt: 'MedCPT 本地', local: '本地服务', openai: 'OpenAI 兼容', huggingface: 'Hugging Face', ollama: 'Ollama' } as Record<string, string>)[provider] || provider
+}
+
+function navigateTo(tab: Tab): void {
+  // Router navigation preserves browser history, so back/forward returns to the
+  // previous workspace page instead of only changing an in-memory tab value.
+  if (route.path !== tabPaths[tab]) void router.push(tabPaths[tab])
+}
+
+function recentDocumentMeta(document: DashboardDocument): string {
+  const type = itemTypeLabel(document.item_type)
+  if (document.chunk_count) return `${type} · ${document.chunk_count} 个持久化知识块`
+  return `${type} · ${document.attachment_count} 个附件`
+}
+
+function recentDocumentState(document: DashboardDocument): string {
+  if (document.has_markdown) return 'MD 已就绪'
+  if (document.has_pdf) return '等待转换'
+  return '暂无附件'
+}
+
+function taskStatusLabel(status: string): string {
+  // Keep raw unknown states visible as a forward-compatible fallback instead of
+  // incorrectly labelling a state introduced by a newer backend.
+  return ({
+    completed: '已完成',
+    superseded: '已被替代',
+    building: '构建中',
+    configured: '已配置',
+    queued: '等待中',
+    running: '处理中',
+    failed: '失败',
+    cancelled: '已取消',
+  } as Record<string, string>)[status] || status
+}
+
+function activeTaskForDocument(documentId: string): ProcessingTask | undefined {
+  // Resource identity, not title or array position, connects a queue row to the
+  // document inspector and protects it from duplicate conversion actions.
+  return tasks.value.find((task) => (
+    task.resource_type === 'document'
+    && task.resource_id === documentId
+    && ['queued', 'running'].includes(task.status)
+  ))
+}
+
+function isDurableTask(task: ProcessingTask): boolean {
+  return /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(task.id)
+}
+
+function isDeletableTask(task: ProcessingTask): boolean {
+  return isDurableTask(task) && ['completed', 'failed', 'cancelled'].includes(task.status)
+}
+
+function isRemovableTask(task: ProcessingTask): boolean {
+  return isDeletableTask(task) || task.id.startsWith('document-version:')
+}
+
+function toggleTaskSelection(taskId: string): void {
+  const next = new Set(selectedTaskIds.value)
+  next.has(taskId) ? next.delete(taskId) : next.add(taskId)
+  selectedTaskIds.value = next
+}
+
+function toggleAllRemovableTasks(): void {
+  selectedTaskIds.value = allRemovableTasksSelected.value
+    ? new Set()
+    : new Set(removableTasks.value.map((task) => task.id))
+}
+
+function conversionButtonLabel(entry: LibraryEntry): string {
+  // Reflect the server task rather than the short POST request. Once enqueued,
+  // convertingDocumentId is cleared but the durable task continues to progress.
+  if (convertingDocumentId.value === entry.id) return '正在创建任务…'
+  const task = activeTaskForDocument(entry.id)
+  if (task?.status === 'queued') return '等待 MinerU'
+  if (task?.status === 'running') {
+    return task.progress === null ? 'MinerU 解析中…' : `MinerU ${task.progress}%`
+  }
+  return 'PDF转MD'
+}
+
+function formatDateTime(value: string): string {
+  const date = new Date(value)
+  if (Number.isNaN(date.getTime())) return '时间未知'
+  return new Intl.DateTimeFormat('zh-CN', {
+    month: '2-digit',
+    day: '2-digit',
+    hour: '2-digit',
+    minute: '2-digit',
+  }).format(date)
 }
 
 function toggleEntry(entryId: string): void {
@@ -206,6 +517,8 @@ function showNotice(kind: NoticeKind, message: string): void {
 }
 
 async function responseError(response: Response): Promise<string> {
+  // FastAPI exposes user-safe messages in detail. Non-JSON proxy/network errors
+  // fall back to a stable message rather than surfacing parsing exceptions.
   try {
     const body = await response.json()
     return typeof body.detail === 'string' ? body.detail : '请求未完成，请重试'
@@ -215,9 +528,11 @@ async function responseError(response: Response): Promise<string> {
 }
 
 async function loadEntries(preferredId?: string | null): Promise<void> {
+  isEntriesLoading.value = true
+  entriesLoadError.value = ''
   try {
     const response = await fetch(`${apiBase}/api/v1/documents?page_size=100`)
-    if (!response.ok) return
+    if (!response.ok) throw new Error(await responseError(response))
     const body = await response.json() as { items: ApiDocument[] }
     entries.value = body.items.map(mapApiDocument)
     const nextId = preferredId && entries.value.some((entry) => entry.id === preferredId)
@@ -225,9 +540,216 @@ async function loadEntries(preferredId?: string | null): Promise<void> {
       : entries.value[0]?.id ?? null
     selectedEntryId.value = nextId
     if (nextId) expandedEntryIds.value = new Set([...expandedEntryIds.value, nextId])
-  } catch {
-    // Keep preview data available while the API is offline.
+  } catch (error) {
+    // Clear stale records when the request fails; showing old data as current is
+    // more dangerous than an explicit recoverable error in a medical workspace.
+    entries.value = []
+    selectedEntryId.value = null
+    entriesLoadError.value = error instanceof Error ? error.message : '文献数据加载失败'
+  } finally {
+    isEntriesLoading.value = false
   }
+}
+
+async function loadConfigurations(): Promise<void> {
+  isConfigurationsLoading.value = true
+  configurationsLoadError.value = ''
+  try {
+    const [chunkingResponse, embeddingResponse] = await Promise.all([
+      fetch(`${apiBase}/api/v1/configurations/chunking-methods`),
+      fetch(`${apiBase}/api/v1/configurations/embedding-models`),
+    ])
+    if (!chunkingResponse.ok) throw new Error(await responseError(chunkingResponse))
+    if (!embeddingResponse.ok) throw new Error(await responseError(embeddingResponse))
+    chunkingMethods.value = await chunkingResponse.json() as ChunkingMethod[]
+    embeddingModels.value = await embeddingResponse.json() as EmbeddingModel[]
+  } catch (error) {
+    chunkingMethods.value = []
+    embeddingModels.value = []
+    configurationsLoadError.value = error instanceof Error ? error.message : '方法与模型配置加载失败'
+  } finally {
+    isConfigurationsLoading.value = false
+  }
+}
+
+async function loadKnowledgeBases(preferredId?: string): Promise<void> {
+  isKnowledgeBasesLoading.value = true
+  knowledgeBasesLoadError.value = ''
+  try {
+    const response = await fetch(`${apiBase}/api/v1/knowledge-bases`)
+    if (!response.ok) throw new Error(await responseError(response))
+    knowledgeBases.value = (await response.json() as ApiKnowledgeBase[]).map(mapKnowledgeBase)
+    if (preferredId) {
+      selectedKnowledgeBase.value = knowledgeBases.value.find((item) => item.id === preferredId) || null
+    } else if (selectedKnowledgeBase.value) {
+      selectedKnowledgeBase.value = knowledgeBases.value.find((item) => item.id === selectedKnowledgeBase.value?.id) || null
+    }
+  } catch (error) {
+    knowledgeBases.value = []
+    selectedKnowledgeBase.value = null
+    knowledgeBasesLoadError.value = error instanceof Error ? error.message : '知识库加载失败'
+  } finally {
+    isKnowledgeBasesLoading.value = false
+  }
+}
+
+async function loadDashboard(): Promise<void> {
+  isDashboardLoading.value = true
+  dashboardLoadError.value = ''
+  try {
+    const response = await fetch(`${apiBase}/api/v1/dashboard`)
+    if (!response.ok) throw new Error(await responseError(response))
+    dashboard.value = await response.json() as DashboardData
+  } catch (error) {
+    dashboard.value = null
+    dashboardLoadError.value = error instanceof Error ? error.message : '工作台数据加载失败'
+  } finally {
+    isDashboardLoading.value = false
+  }
+}
+
+function stopTaskPolling(): void {
+  // Clearing before every reschedule guarantees at most one outstanding timer,
+  // even when refresh, visibilitychange and enqueue complete close together.
+  if (taskPollTimer) clearTimeout(taskPollTimer)
+  taskPollTimer = null
+}
+
+function scheduleTaskPolling(): void {
+  /**
+   * Schedule the next one-shot read only while the queue has live work.
+   * A recursive setTimeout is used instead of setInterval so slow requests can
+   * never overlap. The next timeout is installed only after the request settles.
+   */
+  stopTaskPolling()
+  if (!activeTasks.value.length) return
+  // Poll quickly while visible, but reduce background traffic when the user
+  // switches away. A persisted task never depends on the browser staying open.
+  const delay = document.visibilityState === 'visible' ? 2000 : 10000
+  taskPollTimer = setTimeout(() => void loadTasks(true), delay)
+}
+
+async function loadTasks(background = false): Promise<void> {
+  /**
+   * Refresh the complete activity timeline and reconcile terminal transitions.
+   * Foreground/manual loads own visible loading and error states. Silent polling
+   * preserves the last valid list during transient failures, preventing flicker.
+   */
+  stopTaskPolling()
+  if (!background) isTasksLoading.value = true
+  if (!background) tasksLoadError.value = ''
+  // Capture identity before replacement so a running -> terminal transition can
+  // trigger dependent data refreshes without comparing every task field.
+  const previouslyActive = new Set(activeTasks.value.map((task) => task.id))
+  try {
+    const response = await fetch(`${apiBase}/api/v1/processing-tasks?limit=100`)
+    if (!response.ok) throw new Error(await responseError(response))
+    const nextTasks = await response.json() as ProcessingTask[]
+    tasks.value = nextTasks
+    const removableIds = new Set(nextTasks.filter(isRemovableTask).map((task) => task.id))
+    selectedTaskIds.value = new Set([...selectedTaskIds.value].filter((id) => removableIds.has(id)))
+    const taskJustFinished = nextTasks.some((task) => (
+      previouslyActive.has(task.id) && ['completed', 'failed', 'cancelled'].includes(task.status)
+    ))
+    if (taskJustFinished) {
+      // Completion changes both the attachment slots and dashboard counts.
+      await Promise.all([loadEntries(selectedEntryId.value), loadDashboard(), loadKnowledgeBases()])
+    }
+  } catch (error) {
+    // Background connectivity loss must not erase previously rendered durable
+    // history. A manual load, however, needs an explicit retry state.
+    if (!background) {
+      tasks.value = []
+      tasksLoadError.value = error instanceof Error ? error.message : '处理记录加载失败'
+    }
+  } finally {
+    if (!background) isTasksLoading.value = false
+    scheduleTaskPolling()
+  }
+}
+
+async function retryTask(task: ProcessingTask): Promise<void> {
+  // The server validates status, remaining attempts, and duplicate active work.
+  // Replacing the row locally gives immediate feedback before the next poll.
+  try {
+    const response = await fetch(`${apiBase}/api/v1/processing-tasks/${task.id}/retry`, { method: 'POST' })
+    if (!response.ok) throw new Error(await responseError(response))
+    const retried = await response.json() as ProcessingTask
+    tasks.value = [retried, ...tasks.value.filter((item) => item.id !== retried.id)]
+    scheduleTaskPolling()
+    showNotice('success', '失败任务已重新加入队列')
+  } catch (error) {
+    showNotice('error', error instanceof Error ? error.message : '任务重试失败')
+  }
+}
+
+function markTasksDeleting(taskIds: string[], deleting: boolean): void {
+  const next = new Set(deletingTaskIds.value)
+  for (const taskId of taskIds) deleting ? next.add(taskId) : next.delete(taskId)
+  deletingTaskIds.value = next
+}
+
+function removeTasksFromView(taskIds: string[]): void {
+  const removed = new Set(taskIds)
+  tasks.value = tasks.value.filter((task) => !removed.has(task.id))
+  selectedTaskIds.value = new Set([...selectedTaskIds.value].filter((id) => !removed.has(id)))
+}
+
+async function deleteTask(task: ProcessingTask): Promise<void> {
+  if (!isRemovableTask(task)) return
+  const isHistory = task.id.startsWith('document-version:')
+  const action = isHistory ? '隐藏历史记录' : '删除任务记录'
+  if (!window.confirm(`确定${action}“${task.name}”吗？Markdown 文件、版本和知识库数据不会被删除。`)) return
+  markTasksDeleting([task.id], true)
+  try {
+    const response = await fetch(`${apiBase}/api/v1/processing-tasks/remove`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ activity_ids: [task.id] }),
+    })
+    if (!response.ok) throw new Error(await responseError(response))
+    removeTasksFromView([task.id])
+    showNotice('success', isHistory ? '历史记录已隐藏' : '任务记录已删除')
+  } catch (error) {
+    showNotice('error', error instanceof Error ? error.message : '记录移除失败')
+  } finally {
+    markTasksDeleting([task.id], false)
+  }
+}
+
+async function deleteSelectedTasks(): Promise<void> {
+  const taskIds = [...selectedTaskIds.value]
+  if (!taskIds.length) return
+  if (!window.confirm(`确定移除选中的 ${taskIds.length} 条记录吗？Markdown 文件、版本和知识库数据不会被删除。`)) return
+  markTasksDeleting(taskIds, true)
+  try {
+    const response = await fetch(`${apiBase}/api/v1/processing-tasks/remove`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ activity_ids: taskIds }),
+    })
+    if (!response.ok) throw new Error(await responseError(response))
+    const result = await response.json() as { removed_ids: string[]; removed_count: number }
+    removeTasksFromView(result.removed_ids)
+    showNotice('success', `已移除 ${result.removed_count} 条记录`)
+  } catch (error) {
+    showNotice('error', error instanceof Error ? error.message : '批量删除任务失败')
+  } finally {
+    markTasksDeleting(taskIds, false)
+  }
+}
+
+async function refreshRealData(): Promise<void> {
+  // Top-level datasets do not depend on one another, so load them concurrently.
+  // Individual loaders own their own error states and never inject demo data.
+  await Promise.all([
+    loadEntries(selectedEntryId.value),
+    loadConfigurations(),
+    loadKnowledgeBases(),
+    loadDashboard(),
+    loadTasks(),
+    checkService(),
+  ])
 }
 
 async function checkService(): Promise<void> {
@@ -283,6 +805,7 @@ async function createEntry(): Promise<void> {
     selectedEntryId.value = entry.id
     isCreateDialogOpen.value = false
     resetCreateForm()
+    await loadDashboard()
     showNotice('success', '文献条目已创建，可继续添加附件')
   } catch (error) {
     showNotice('error', error instanceof Error ? error.message : '创建条目失败，请重试')
@@ -292,7 +815,7 @@ async function createEntry(): Promise<void> {
 }
 
 function attachmentKind(attachment: Attachment): string {
-  return attachment.name.toLocaleLowerCase().endsWith('.md') ? 'MD' : 'PDF'
+  return attachment.kind === 'markdown' || attachment.name.toLocaleLowerCase().endsWith('.md') ? 'MD' : 'PDF'
 }
 
 function attachmentContentUrl(attachment: Attachment, download = false): string {
@@ -339,6 +862,8 @@ function removeUploadFile(index: number): void {
 }
 
 async function submitUpload(): Promise<void> {
+  // Existing entries are version slots, not arbitrary file buckets. Detect
+  // replacement on the client so the user explicitly confirms data loss.
   if (!selectedUploadFiles.value.length) {
     showNotice('error', '请先选择 PDF 或 Markdown 文件')
     return
@@ -347,25 +872,47 @@ async function submitUpload(): Promise<void> {
     showNotice('error', '请选择要添加附件的条目')
     return
   }
+  let replaceExisting = false
+  if (uploadDestination.value === 'existing') {
+    const incomingKinds = selectedUploadFiles.value.map((file) => file.name.toLowerCase().endsWith('.md') ? 'MD' : 'PDF')
+    if (new Set(incomingKinds).size !== incomingKinds.length) {
+      showNotice('error', '同一条目一次最多上传一个 PDF 和一个 MD')
+      return
+    }
+    const target = entries.value.find((entry) => entry.id === uploadTargetId.value)
+    const conflicts = incomingKinds.filter((kind) => target?.attachments.some((file) => attachmentKind(file) === kind))
+    if (conflicts.length) {
+      const labels = [...new Set(conflicts)].join('、')
+      if (!window.confirm(`该条目已经有 ${labels} 文件。继续上传会替代原文件，并清理磁盘上的旧文件。是否继续？`)) return
+      replaceExisting = true
+    }
+  }
   const formData = new FormData()
   selectedUploadFiles.value.forEach((file) => formData.append('files', file))
   const endpoint = uploadDestination.value === 'new'
     ? `${apiBase}/api/v1/documents/from-files`
-    : `${apiBase}/api/v1/documents/${uploadTargetId.value}/files/batch`
+    : `${apiBase}/api/v1/documents/${uploadTargetId.value}/files/batch${replaceExisting ? '?replace_existing=true' : ''}`
+  const uploadedFileCount = selectedUploadFiles.value.length
+  const destination = uploadDestination.value
   isUploading.value = true
   try {
     const response = await fetch(endpoint, { method: 'POST', body: formData })
     if (!response.ok) throw new Error(await responseError(response))
     const result = await response.json() as ApiDocument | ApiDocument[]
     const preferredId = Array.isArray(result) ? result[0]?.id : result.id
-    await loadEntries(preferredId)
+    // The upload request is the transaction boundary. Close the dialog as soon
+    // as it succeeds instead of making the user wait for three secondary reads.
     isUploadDialogOpen.value = false
+    selectedUploadFiles.value = []
+    uploadTargetId.value = ''
     showNotice(
       'success',
-      uploadDestination.value === 'new'
-        ? `已创建 ${selectedUploadFiles.value.length} 个条目并识别元数据`
-        : `已添加 ${selectedUploadFiles.value.length} 个附件`,
+      destination === 'new'
+        ? `已按文件名创建 ${uploadedFileCount} 个条目，并识别其他元数据`
+        : replaceExisting ? '文件已替代并更新 MD 版本' : `已添加 ${uploadedFileCount} 个附件`,
     )
+    await nextTick()
+    await Promise.all([loadEntries(preferredId), loadDashboard(), loadTasks()])
   } catch (error) {
     showNotice('error', error instanceof Error ? error.message : '文件上传失败，请重试')
   } finally {
@@ -373,8 +920,73 @@ async function submitUpload(): Promise<void> {
   }
 }
 
+async function convertPdfToMarkdown(entry: LibraryEntry): Promise<void> {
+  /**
+   * Validate the visible document state, then enqueue—never execute—conversion.
+   * The returned task is inserted immediately so controls lock without waiting
+   * for the next timeline fetch. PostgreSQL/Worker processing then survives tab
+   * closure, navigation and frontend refreshes.
+   */
+  if (activeTaskForDocument(entry.id)) {
+    showNotice('info', '该文献已有 PDF 转换任务正在处理中')
+    return
+  }
+  const pdf = entry.attachments.find((file) => attachmentKind(file) === 'PDF')
+  if (!pdf) {
+    showNotice('error', '该条目没有可转换的 PDF 文件')
+    return
+  }
+  const hasMarkdown = entry.attachments.some((file) => attachmentKind(file) === 'MD')
+  if (hasMarkdown && !window.confirm('该条目已经有 MD 文件。MinerU 转换完成后会替代现有 MD，并清理旧文件。是否继续？')) return
+  convertingDocumentId.value = entry.id
+  try {
+    const response = await fetch(
+      `${apiBase}/api/v1/documents/${entry.id}/convert-pdf${hasMarkdown ? '?replace_existing=true' : ''}`,
+      { method: 'POST' },
+    )
+    if (!response.ok) throw new Error(await responseError(response))
+    const task = await response.json() as ProcessingTask
+    // Filtering first also handles the backend returning an already-active task
+    // after a duplicate/racing enqueue, without rendering it twice.
+    tasks.value = [task, ...tasks.value.filter((item) => item.id !== task.id)]
+    scheduleTaskPolling()
+    showNotice('success', hasMarkdown ? '重新生成任务已加入队列' : 'PDF 转 MD 任务已加入队列')
+  } catch (error) {
+    showNotice('error', error instanceof Error ? error.message : 'PDF 转 MD 任务创建失败')
+  } finally {
+    convertingDocumentId.value = null
+  }
+}
+
 function stripMarkdownFrontmatter(markdown: string): string {
   return markdown.replace(/^\uFEFF?---\s*\r?\n[\s\S]*?\r?\n---\s*(?:\r?\n|$)/, '')
+}
+
+function normalizeMarkdownForDisplay(markdown: string): string {
+  // MinerU and many Chinese guidelines emit compact numbered items such as
+  // `1.院前急救`. CommonMark requires a space after the marker, so normalize
+  // that display-only form without changing the stored chunk or its offsets.
+  return stripMarkdownFrontmatter(markdown).replace(/^(\s*)(\d+)\.(?=\S)/gm, '$1$2. ')
+}
+
+function renderMarkdownHtml(markdown: string, emptyMessage = '此分块暂无正文。'): string {
+  const rendered = marked.parse(normalizeMarkdownForDisplay(markdown), {
+    gfm: true,
+    breaks: false,
+    async: false,
+  }) as string
+  const sanitized = DOMPurify.sanitize(rendered, {
+    USE_PROFILES: { html: true },
+    FORBID_ATTR: ['style'],
+    ALLOW_DATA_ATTR: true,
+  })
+  const container = document.createElement('div')
+  container.innerHTML = sanitized
+  container.querySelectorAll('a').forEach((link) => {
+    link.target = '_blank'
+    link.rel = 'noopener noreferrer'
+  })
+  return container.innerHTML || `<p>${emptyMessage}</p>`
 }
 
 async function previewFile(attachment: Attachment): Promise<void> {
@@ -390,17 +1002,8 @@ async function previewFile(attachment: Attachment): Promise<void> {
   try {
     const response = await fetch(attachmentContentUrl(attachment), { signal: controller.signal })
     if (!response.ok) throw new Error(await responseError(response))
-    const markdown = stripMarkdownFrontmatter(await response.text())
-    const rendered = await marked.parse(markdown, { gfm: true, breaks: false })
-    const sanitized = DOMPurify.sanitize(rendered)
-    const container = document.createElement('div')
-    container.innerHTML = sanitized
-    container.querySelectorAll('a').forEach((link) => {
-      link.target = '_blank'
-      link.rel = 'noopener noreferrer'
-    })
     if (previewAttachment.value?.id === attachment.id) {
-      markdownPreviewHtml.value = container.innerHTML || '<p>此 Markdown 文件暂无正文。</p>'
+      markdownPreviewHtml.value = renderMarkdownHtml(await response.text(), '此 Markdown 文件暂无正文。')
     }
   } catch (error) {
     if (error instanceof DOMException && error.name === 'AbortError') return
@@ -439,7 +1042,7 @@ async function deleteAttachment(attachment: Attachment): Promise<void> {
   try {
     const response = await fetch(`${apiBase}/api/v1/documents/attachments/${attachment.id}`, { method: 'DELETE' })
     if (!response.ok) throw new Error(await responseError(response))
-    await loadEntries(selectedEntryId.value)
+    await Promise.all([loadEntries(selectedEntryId.value), loadDashboard(), loadTasks()])
     showNotice('success', '附件已删除')
   } catch (error) {
     showNotice('error', error instanceof Error ? error.message : '附件删除失败')
@@ -465,7 +1068,7 @@ async function moveFile(): Promise<void> {
     if (!response.ok) throw new Error(await responseError(response))
     const targetId = moveTargetId.value
     movingAttachment.value = null
-    await loadEntries(targetId)
+    await Promise.all([loadEntries(targetId), loadDashboard(), loadTasks()])
     showNotice('success', '附件已移动到目标条目')
   } catch (error) {
     showNotice('error', error instanceof Error ? error.message : '附件移动失败')
@@ -475,12 +1078,20 @@ async function moveFile(): Promise<void> {
 }
 
 async function deleteSelectedEntry(): Promise<void> {
+  if (selectedEntryActiveTask.value) {
+    showNotice('error', '该文献正在执行后台任务，完成后才能删除')
+    return
+  }
+  if (selectedEntryKnowledgeBases.value.length) {
+    showNotice('error', '该文献已加入知识库，请先从知识库中移除后再删除')
+    return
+  }
   if (!selectedEntry.value || !window.confirm(`确定删除条目“${selectedEntry.value.title}”吗？其全部附件文件也会被清理。`)) return
   isDeletingEntry.value = true
   try {
     const response = await fetch(`${apiBase}/api/v1/documents/${selectedEntry.value.id}`, { method: 'DELETE' })
     if (!response.ok) throw new Error(await responseError(response))
-    await loadEntries(null)
+    await Promise.all([loadEntries(null), loadDashboard(), loadTasks()])
     showNotice('success', '条目及其附件已删除')
   } catch (error) {
     showNotice('error', error instanceof Error ? error.message : '条目删除失败')
@@ -489,31 +1100,400 @@ async function deleteSelectedEntry(): Promise<void> {
   }
 }
 
+function chunkingConfigPayload(): Record<string, unknown> {
+  // Preview and registration must send exactly the same persisted recipe.
+  return {
+    target_chars: chunkingForm.targetChars,
+    max_chars: chunkingForm.maxChars,
+    min_chars: chunkingForm.minChars,
+    overlap: chunkingForm.overlap,
+    max_chunks: chunkingForm.maxChunks,
+    heading_levels: [...chunkingForm.headingLevels].sort(),
+    merge_short_sections: chunkingForm.mergeShortSections,
+    prepend_heading_path: chunkingForm.prependHeadingPath,
+    preserve_tables: chunkingForm.preserveTables,
+    preserve_code_blocks: chunkingForm.preserveCodeBlocks,
+  }
+}
+
+function currentChunkingPreviewSignature(): string {
+  // Changing either the sample or a parameter invalidates the previous dry run.
+  return JSON.stringify({
+    documentId: chunkingPreviewDocumentId.value,
+    strategy: chunkingForm.strategy,
+    config: chunkingConfigPayload(),
+  })
+}
+
+function openChunkingDialog(): void {
+  chunkingStep.value = 1
+  chunkingPreviewDocumentId.value = markdownReadyEntries.value[0]?.id || ''
+  chunkingPreview.value = []
+  chunkingPreviewStats.value = null
+  chunkingPreviewError.value = ''
+  chunkingPreviewSignature.value = ''
+  isChunkingDialogOpen.value = true
+}
+
+function toggleHeadingLevel(level: number): void {
+  chunkingForm.headingLevels = chunkingForm.headingLevels.includes(level)
+    ? chunkingForm.headingLevels.filter((item) => item !== level)
+    : [...chunkingForm.headingLevels, level].sort()
+  chunkingPreviewSignature.value = ''
+}
+
+function goToChunkingStep(step: number): void {
+  if (step > 1 && !chunkingForm.name.trim()) {
+    showNotice('error', '请先填写分块方法名称')
+    return
+  }
+  if (step > 2) {
+    if (chunkingForm.minChars > chunkingForm.targetChars || chunkingForm.targetChars > chunkingForm.maxChars) {
+      showNotice('error', '字符范围需要满足：最小字符 ≤ 目标字符 ≤ 最大字符')
+      return
+    }
+    if (chunkingForm.overlap >= chunkingForm.maxChars / 2) {
+      showNotice('error', '重叠字符数必须小于最大字符数的一半')
+      return
+    }
+    if (chunkingForm.strategy === 'heading' && !chunkingForm.headingLevels.length) {
+      showNotice('error', '请至少选择一个标题层级')
+      return
+    }
+  }
+  chunkingStep.value = step
+}
+
+async function previewChunkingMethod(): Promise<void> {
+  if (!chunkingPreviewDocumentId.value) {
+    showNotice('error', '请先选择一篇已经有 MD 版本的样本文献')
+    return
+  }
+  isChunkingPreviewLoading.value = true
+  chunkingPreviewError.value = ''
+  chunkingPreview.value = []
+  chunkingPreviewStats.value = null
+  try {
+    const response = await fetch(`${apiBase}/api/v1/configurations/chunking-methods/preview`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        document_id: chunkingPreviewDocumentId.value,
+        strategy: chunkingForm.strategy,
+        config: chunkingConfigPayload(),
+      }),
+    })
+    if (!response.ok) throw new Error(await responseError(response))
+    const result = await response.json() as { chunks: ChunkPreviewItem[]; stats: ChunkPreviewStats }
+    chunkingPreview.value = result.chunks
+    chunkingPreviewStats.value = result.stats
+    chunkingPreviewSignature.value = currentChunkingPreviewSignature()
+  } catch (error) {
+    chunkingPreviewError.value = error instanceof Error ? error.message : '分块预览生成失败'
+  } finally {
+    isChunkingPreviewLoading.value = false
+  }
+}
+
+async function registerChunkingMethod(): Promise<void> {
+  if (!chunkingForm.name.trim()) {
+    showNotice('error', '请填写分块方法名称')
+    return
+  }
+  // Never save a recipe that has not succeeded with its exact current settings.
+  if (chunkingPreviewSignature.value !== currentChunkingPreviewSignature()) {
+    chunkingStep.value = 3
+    showNotice('error', '请使用当前参数成功生成一次预览后再注册')
+    return
+  }
+  isSavingChunkingMethod.value = true
+  try {
+    const response = await fetch(`${apiBase}/api/v1/configurations/chunking-methods`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        name: chunkingForm.name.trim(),
+        strategy: chunkingForm.strategy,
+        description: chunkingForm.description.trim() || null,
+        color: chunkingForm.color,
+        config: chunkingConfigPayload(),
+      }),
+    })
+    if (!response.ok) throw new Error(await responseError(response))
+    chunkingForm.name = ''
+    chunkingForm.description = ''
+    await loadConfigurations()
+    isChunkingDialogOpen.value = false
+    showNotice('success', '分块方法已注册')
+  } catch (error) {
+    showNotice('error', error instanceof Error ? error.message : '分块方法注册失败')
+  } finally {
+    isSavingChunkingMethod.value = false
+  }
+}
+
+async function registerEmbeddingModel(): Promise<void> {
+  if (!embeddingForm.name.trim() || !embeddingForm.modelName.trim()) {
+    showNotice('error', '请填写显示名称和模型标识')
+    return
+  }
+  isSavingEmbeddingModel.value = true
+  try {
+    const response = await fetch(`${apiBase}/api/v1/configurations/embedding-models`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        name: embeddingForm.name.trim(),
+        provider: embeddingForm.provider,
+        model_name: embeddingForm.modelName.trim(),
+        dimension: embeddingForm.dimension || null,
+        base_url: embeddingForm.baseUrl.trim() || null,
+        config: {},
+      }),
+    })
+    if (!response.ok) throw new Error(await responseError(response))
+    embeddingForm.name = 'MedCPT（本地双编码器）'
+    embeddingForm.provider = 'medcpt'
+    embeddingForm.modelName = 'ncbi/MedCPT-Article-Encoder'
+    embeddingForm.dimension = 768
+    embeddingForm.baseUrl = ''
+    await loadConfigurations()
+    isEmbeddingDialogOpen.value = false
+    showNotice('success', '嵌入模型已注册')
+  } catch (error) {
+    showNotice('error', error instanceof Error ? error.message : '嵌入模型注册失败')
+  } finally {
+    isSavingEmbeddingModel.value = false
+  }
+}
+
+async function downloadEmbeddingModel(model: EmbeddingModel): Promise<void> {
+  downloadingModelId.value = model.id
+  try {
+    const response = await fetch(`${apiBase}/api/v1/configurations/embedding-models/${model.id}/download`, { method: 'POST' })
+    if (!response.ok) throw new Error(await responseError(response))
+    const task = await response.json() as ProcessingTask
+    tasks.value = [task, ...tasks.value.filter((item) => item.id !== task.id)]
+    scheduleTaskPolling()
+    showNotice('success', 'MedCPT 查询与文献编码器已加入下载队列')
+  } catch (error) {
+    showNotice('error', error instanceof Error ? error.message : 'MedCPT 模型下载任务创建失败')
+  } finally {
+    downloadingModelId.value = null
+  }
+}
+
+function closeChunkingDialog(): void {
+  if (!isSavingChunkingMethod.value) isChunkingDialogOpen.value = false
+}
+
+function closeEmbeddingDialog(): void {
+  if (!isSavingEmbeddingModel.value) isEmbeddingDialogOpen.value = false
+}
+
+async function deleteConfiguration(kind: 'chunking-methods' | 'embedding-models', id: string, name: string): Promise<void> {
+  if (!window.confirm(`确定删除“${name}”吗？`)) return
+  deletingConfigurationId.value = id
+  try {
+    const response = await fetch(`${apiBase}/api/v1/configurations/${kind}/${id}`, { method: 'DELETE' })
+    if (!response.ok) throw new Error(await responseError(response))
+    await loadConfigurations()
+    showNotice('success', '配置已删除')
+  } catch (error) {
+    showNotice('error', error instanceof Error ? error.message : '配置删除失败')
+  } finally {
+    deletingConfigurationId.value = null
+  }
+}
+
+function openKnowledgeDialog(): void {
+  if (!markdownReadyEntries.value.length) {
+    showNotice('error', '知识库只能加入 MD 文本，请先上传 MD 或使用 MinerU 将 PDF 转为 MD')
+    return
+  }
+  knowledgeForm.name = ''
+  knowledgeForm.description = ''
+  knowledgeForm.documentIds = []
+  knowledgeForm.chunkingMethodId = chunkingMethods.value[0]?.id || ''
+  knowledgeForm.embeddingModelId = embeddingModels.value[0]?.id || ''
+  isKnowledgeDialogOpen.value = true
+}
+
+function closeKnowledgeDialog(): void {
+  if (!isSavingKnowledgeBase.value) isKnowledgeDialogOpen.value = false
+}
+
+async function createKnowledgeBase(): Promise<void> {
+  if (!knowledgeForm.name.trim()) {
+    showNotice('error', '请填写知识库名称')
+    return
+  }
+  if (!knowledgeForm.documentIds.length) {
+    showNotice('error', '请至少选择一篇文献')
+    return
+  }
+  if (!knowledgeForm.chunkingMethodId || !knowledgeForm.embeddingModelId) {
+    showNotice('error', '请选择分块方法和嵌入模型')
+    return
+  }
+  isSavingKnowledgeBase.value = true
+  try {
+    const response = await fetch(`${apiBase}/api/v1/knowledge-bases`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        name: knowledgeForm.name.trim(),
+        description: knowledgeForm.description.trim() || null,
+        document_ids: knowledgeForm.documentIds,
+        chunking_method_id: knowledgeForm.chunkingMethodId,
+        embedding_model_id: knowledgeForm.embeddingModelId,
+      }),
+    })
+    if (!response.ok) throw new Error(await responseError(response))
+    const created = mapKnowledgeBase(await response.json() as ApiKnowledgeBase)
+    await Promise.all([loadKnowledgeBases(created.id), loadDashboard(), loadTasks()])
+    isKnowledgeDialogOpen.value = false
+    showNotice('success', '知识库已创建并保存构建配置')
+  } catch (error) {
+    showNotice('error', error instanceof Error ? error.message : '知识库创建失败')
+  } finally {
+    isSavingKnowledgeBase.value = false
+  }
+}
+
+function openKnowledgeBase(item: KnowledgeBase): void {
+  selectedKnowledgeBase.value = item
+  selectedKnowledgeDocument.value = null
+  chunkPreview.value = []
+  chunkPreviewError.value = ''
+  knowledgeSearchQuery.value = ''
+  knowledgeSearchResults.value = []
+  knowledgeSearchError.value = ''
+}
+
+function closeKnowledgeBase(): void {
+  selectedKnowledgeBase.value = null
+  selectedKnowledgeDocument.value = null
+  chunkPreview.value = []
+  chunkPreviewError.value = ''
+}
+
+async function buildKnowledgeBase(): Promise<void> {
+  if (!selectedKnowledgeBase.value) return
+  const library = selectedKnowledgeBase.value
+  buildingKnowledgeBaseId.value = library.id
+  try {
+    const response = await fetch(`${apiBase}/api/v1/knowledge-bases/${library.id}/build`, { method: 'POST' })
+    if (!response.ok) throw new Error(await responseError(response))
+    const task = await response.json() as ProcessingTask
+    tasks.value = [task, ...tasks.value.filter((item) => item.id !== task.id)]
+    selectedKnowledgeBase.value.status = 'building'
+    scheduleTaskPolling()
+    showNotice('success', 'MedCPT 向量构建任务已加入队列')
+  } catch (error) {
+    showNotice('error', error instanceof Error ? error.message : '向量构建任务创建失败')
+  } finally {
+    buildingKnowledgeBaseId.value = null
+  }
+}
+
+async function searchKnowledgeBase(): Promise<void> {
+  if (!selectedKnowledgeBase.value || !knowledgeSearchQuery.value.trim()) return
+  isKnowledgeSearching.value = true
+  knowledgeSearchError.value = ''
+  knowledgeSearchResults.value = []
+  try {
+    const response = await fetch(`${apiBase}/api/v1/knowledge-bases/${selectedKnowledgeBase.value.id}/search`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ query: knowledgeSearchQuery.value.trim(), top_k: 8 }),
+    })
+    if (!response.ok) throw new Error(await responseError(response))
+    const result = await response.json() as { items: KnowledgeSearchHit[] }
+    knowledgeSearchResults.value = result.items
+  } catch (error) {
+    knowledgeSearchError.value = error instanceof Error ? error.message : '知识库检索失败'
+  } finally {
+    isKnowledgeSearching.value = false
+  }
+}
+
+async function openKnowledgeDocument(document: LibraryEntry): Promise<void> {
+  if (!selectedKnowledgeBase.value) return
+  selectedKnowledgeDocument.value = document
+  chunkPreview.value = []
+  chunkPreviewError.value = ''
+  isChunkPreviewLoading.value = true
+  try {
+    const response = await fetch(`${apiBase}/api/v1/knowledge-bases/${selectedKnowledgeBase.value.id}/documents/${document.id}/chunks`)
+    if (!response.ok) throw new Error(await responseError(response))
+    const result = await response.json() as { chunks: ChunkPreviewItem[] }
+    chunkPreview.value = result.chunks
+  } catch (error) {
+    chunkPreviewError.value = error instanceof Error ? error.message : '分块预览加载失败'
+  } finally {
+    isChunkPreviewLoading.value = false
+  }
+}
+
 onMounted(() => {
-  void Promise.all([checkService(), loadEntries()])
+  // Initial hydration uses only real APIs. Visibility changes recalculate the
+  // next delay so a background tab immediately drops to the lower poll rate.
+  void refreshRealData()
+  document.addEventListener('visibilitychange', scheduleTaskPolling)
+})
+
+onBeforeUnmount(() => {
+  // Prevent a detached page from continuing network requests after navigation
+  // or hot-module replacement during development.
+  stopTaskPolling()
+  document.removeEventListener('visibilitychange', scheduleTaskPolling)
 })
 </script>
 
 <template>
   <div class="shell">
     <aside>
-      <button class="brand" type="button" aria-label="返回欢迎页" @click="activeTab = 'welcome'">
-        <span class="brand-mark">ICH</span>
-        <span class="brand-copy"><strong>循证库</strong><small>脑出血专病知识服务</small></span>
-      </button>
+      <RouterLink class="brand" :to="tabPaths.welcome" aria-label="返回欢迎页">
+        <span class="brand-mark" aria-hidden="true">
+          <svg class="brand-glyph" viewBox="0 0 26 12" focusable="false">
+            <path d="M0 0h2v12H0zM12 0H6C4.9 0 4 .9 4 2v8c0 1.1.9 2 2 2h6v-2H6V2h6zM15 0h2v5h7V0h2v12h-2V7h-7v5h-2z" />
+          </svg>
+        </span>
+        <span class="brand-copy"><strong>循证医学平台</strong><small>ICH EVIDENCE OS</small></span>
+      </RouterLink>
+      <div class="platform-switcher" role="navigation" aria-label="平台应用切换">
+        <a class="active" href="/knowledge/" aria-current="page">知识空间</a>
+        <a href="/agent/">智能问答</a>
+        <a href="/evaluation/">评测中心</a>
+      </div>
+      <p class="sidebar-section-label">知识工作台</p>
       <nav aria-label="知识服务导航">
-        <button v-for="tab in tabs" :key="tab.id" class="nav-item" :class="{ active: activeTab === tab.id }" :aria-current="activeTab === tab.id ? 'page' : undefined" type="button" @click="activeTab = tab.id">
-          <span>{{ tab.label }}</span><small>{{ tab.hint }}</small>
-        </button>
+        <RouterLink v-for="tab in tabs" :key="tab.id" class="nav-item" :class="{ active: activeTab === tab.id }" :aria-current="activeTab === tab.id ? 'page' : undefined" :to="tab.path">
+          <span>{{ tab.label }}</span>
+        </RouterLink>
       </nav>
       <div class="aside-foot"><i :class="serviceState"></i>知识服务 {{ serviceState === 'online' ? '在线' : serviceState === 'offline' ? '未连接' : '检测中' }}</div>
     </aside>
 
     <main>
+      <div v-if="notice" class="notice" :class="notice.kind" :role="notice.kind === 'error' ? 'alert' : 'status'"><span>{{ notice.message }}</span><button type="button" aria-label="关闭提示" @click="notice = null">×</button></div>
+
       <template v-if="activeTab === 'welcome'">
-        <header><div><p class="eyebrow">Knowledge workspace</p><h1>从文献到<span>可追溯证据</span></h1><p>集中管理脑出血研究，让每条医学结论都能回到原始页码与版本。</p></div><button type="button" @click="activeTab = 'documents'">进入文献管理</button></header>
-        <section class="signal"><div><b>24</b><span>本周新增文献</span></div><div><b>1,284</b><span>可检索知识块</span></div><div><b>93%</b><span>已审核证据</span></div><div class="flow"><span>PDF</span><em></em><span>章节</span><em></em><span>Chunk</span><em></em><span>证据</span></div></section>
-        <section class="content"><div class="section-title"><div><p class="eyebrow">Recent library</p><h2>最近处理</h2></div><button class="text-action" type="button" @click="activeTab = 'documents'">查看全部 →</button></div><div class="doc-list"><article v-for="(doc, i) in recentDocuments" :key="doc.title"><span class="file-no">0{{ i + 1 }}</span><div><h3>{{ doc.title }}</h3><p>{{ doc.meta }}</p></div><span class="tag">{{ doc.state }}</span></article></div></section>
+        <header><div><p class="eyebrow">Knowledge workspace</p><h1>从文献到<span>可追溯证据</span></h1><p>集中管理脑出血研究，让每条医学结论都能回到原始页码与版本。</p></div><button type="button" @click="navigateTo('documents')">进入文献管理</button></header>
+        <section class="signal" :aria-busy="isDashboardLoading">
+          <div><b>{{ dashboard?.documents_this_week ?? '—' }}</b><span>近 7 天新增文献</span></div>
+          <div><b>{{ dashboard?.persisted_chunks ?? '—' }}</b><span>持久化知识块</span></div>
+          <div><b>{{ dashboard?.markdown_ready ?? '—' }}</b><span>MD 已就绪文献</span></div>
+          <div><b>{{ dashboard?.knowledge_bases ?? '—' }}</b><span>已建知识库</span></div>
+        </section>
+        <section class="content">
+          <div class="section-title"><div><p class="eyebrow">Recent library</p><h2>最近文献</h2></div><button class="text-action" type="button" @click="navigateTo('documents')">查看全部 →</button></div>
+          <div v-if="isDashboardLoading" class="data-state" role="status"><span class="loading-ring"></span><p>正在读取工作台数据…</p></div>
+          <div v-else-if="dashboardLoadError" class="data-state error" role="alert"><p>{{ dashboardLoadError }}</p><button type="button" @click="loadDashboard">重新加载</button></div>
+          <div v-else-if="recentDocuments.length" class="doc-list"><article v-for="(doc, i) in recentDocuments" :key="doc.id"><span class="file-no">{{ String(i + 1).padStart(2, '0') }}</span><div><h3>{{ doc.title }}</h3><p>{{ recentDocumentMeta(doc) }}</p></div><span class="tag">{{ recentDocumentState(doc) }}</span></article></div>
+          <div v-else class="data-state"><p>还没有真实文献记录。</p><button type="button" @click="openUploadDialog('new')">添加第一份文件</button></div>
+        </section>
       </template>
 
       <template v-else-if="activeTab === 'documents'">
@@ -525,15 +1505,15 @@ onMounted(() => {
           </div>
         </header>
 
-        <div v-if="notice" class="notice" :class="notice.kind" :role="notice.kind === 'error' ? 'alert' : 'status'"><span>{{ notice.message }}</span><button type="button" aria-label="关闭提示" @click="notice = null">×</button></div>
-
         <section class="document-toolbar" aria-label="文献筛选">
           <label class="search-field"><span>搜索条目</span><span class="input-wrap"><svg aria-hidden="true" viewBox="0 0 24 24"><circle cx="11" cy="11" r="6"/><path d="m16 16 4 4"/></svg><input v-model.trim="searchQuery" type="search" placeholder="标题、作者或 DOI" /></span></label>
           <label class="filter-field"><span>条目类型</span><select v-model="itemFilter"><option value="all">全部类型</option><option value="journalArticle">期刊论文</option><option value="guideline">临床指南</option><option value="report">报告</option><option value="document">文档</option></select></label>
           <div class="library-summary"><strong>{{ entries.length }}</strong><span>个条目</span><strong>{{ totalAttachments }}</strong><span>个附件</span></div>
         </section>
 
-        <section class="reference-workspace" aria-label="文献条目工作区">
+        <section v-if="isEntriesLoading" class="data-state page-data-state" role="status"><span class="loading-ring"></span><p>正在读取文献条目…</p></section>
+        <section v-else-if="entriesLoadError" class="data-state page-data-state error" role="alert"><p>{{ entriesLoadError }}</p><button type="button" @click="loadEntries()">重新加载</button></section>
+        <section v-else class="reference-workspace" aria-label="文献条目工作区">
           <div class="entry-pane">
             <div class="pane-heading"><div><p class="eyebrow">My library</p><h2>我的文献</h2></div><span>{{ filteredEntries.length }} 条</span></div>
             <div v-if="filteredEntries.length" class="entry-tree">
@@ -551,28 +1531,174 @@ onMounted(() => {
 
           <section class="entry-inspector" aria-label="条目详情">
             <template v-if="selectedEntry">
-              <div class="inspector-heading"><span>{{ itemTypeLabel(selectedEntry.itemType) }}</span><button class="danger-link" type="button" :disabled="isDeletingEntry" @click="deleteSelectedEntry">{{ isDeletingEntry ? '正在删除…' : '删除条目' }}</button></div>
+              <div class="inspector-heading"><span>{{ itemTypeLabel(selectedEntry.itemType) }}</span><button class="danger-link" type="button" :disabled="isDeletingEntry || selectedEntryKnowledgeBases.length > 0 || Boolean(selectedEntryActiveTask)" :title="selectedEntryKnowledgeBases.length ? `已加入知识库：${selectedEntryKnowledgeBases.map((item) => item.name).join('、')}` : selectedEntryActiveTask ? '后台任务处理期间不能删除文献' : '删除条目及其附件'" @click="deleteSelectedEntry">{{ isDeletingEntry ? '正在删除…' : selectedEntryKnowledgeBases.length ? '知识库使用中' : selectedEntryActiveTask ? '后台任务处理中' : '删除条目' }}</button></div>
+              <p v-if="selectedEntryKnowledgeBases.length" class="protected-entry-note">该文献已加入 {{ selectedEntryKnowledgeBases.map((item) => `“${item.name}”`).join('、') }}，需先从知识库移除才能删除。</p>
+              <p v-else-if="selectedEntryActiveTask" class="protected-entry-note" role="status">{{ selectedEntryActiveTask.message || '后台任务正在处理该文献' }}，完成前不能修改附件或删除条目。</p>
               <h2>{{ selectedEntry.title }}</h2>
               <p class="inspector-authors">{{ selectedEntry.authors.join('、') || '未填写作者' }}</p>
               <dl><div><dt>年份</dt><dd>{{ selectedEntry.year || '—' }}</dd></div><div><dt>DOI</dt><dd>{{ selectedEntry.doi || '—' }}</dd></div><div><dt>附件</dt><dd>{{ selectedEntry.attachments.length }} 个</dd></div></dl>
               <div class="abstract-block"><h3>摘要</h3><p>{{ selectedEntry.abstract || '暂无摘要。' }}</p></div>
-              <div class="inspector-attachments"><div><h3>附件</h3><button class="text-action" type="button" :disabled="isUploading" @click="openUploadDialog('existing')">＋ 添加附件</button></div><ul v-if="selectedEntry.attachments.length"><li v-for="attachment in selectedEntry.attachments" :key="attachment.id"><span class="pdf-icon" :class="{ markdown: attachmentKind(attachment) === 'MD' }">{{ attachmentKind(attachment) }}</span><span class="attachment-copy"><strong>{{ attachment.name }}</strong><small>{{ formatFileSize(attachment.sizeBytes) }}</small></span><span class="attachment-actions"><button type="button" @click="previewFile(attachment)">预览</button><button type="button" @click="downloadFile(attachment)">下载</button><button type="button" :disabled="!moveTargets.length" @click="openMoveDialog(attachment)">移动</button><button class="danger" type="button" :disabled="deletingAttachmentId === attachment.id" @click="deleteAttachment(attachment)">{{ deletingAttachmentId === attachment.id ? '删除中' : '删除' }}</button></span></li></ul><p v-else>暂无附件，可添加 PDF 或 Markdown 文件。</p></div>
+              <div class="inspector-attachments"><div><h3>文件版本</h3><span class="attachment-header-actions"><button v-if="selectedEntry.attachments.some((file) => attachmentKind(file) === 'PDF')" class="text-action" type="button" :disabled="convertingDocumentId === selectedEntry.id || Boolean(selectedEntryActiveTask)" @click="convertPdfToMarkdown(selectedEntry)">{{ conversionButtonLabel(selectedEntry) }}</button><button class="text-action" type="button" :disabled="isUploading || Boolean(selectedEntryActiveTask)" @click="openUploadDialog('existing')">添加文件 ＋</button></span></div><p class="attachment-policy">每个条目最多保存一份 PDF 原件和一份 MD 文本；知识库只使用 MD。</p><ul v-if="selectedEntry.attachments.length"><li v-for="attachment in selectedEntry.attachments" :key="attachment.id"><span class="pdf-icon" :class="{ markdown: attachmentKind(attachment) === 'MD' }">{{ attachmentKind(attachment) }}</span><span class="attachment-copy"><strong>{{ attachment.name }}</strong><small>{{ formatFileSize(attachment.sizeBytes) }}<template v-if="attachment.source === 'mineru'"> · MinerU 生成</template><template v-else> · 用户上传</template></small></span><span class="attachment-actions"><button type="button" @click="previewFile(attachment)">预览</button><button type="button" @click="downloadFile(attachment)">下载</button><button type="button" :disabled="!moveTargets.length || Boolean(selectedEntryActiveTask)" @click="openMoveDialog(attachment)">移动</button><button class="danger" type="button" :disabled="deletingAttachmentId === attachment.id || Boolean(selectedEntryActiveTask)" @click="deleteAttachment(attachment)">{{ deletingAttachmentId === attachment.id ? '删除中' : '删除' }}</button></span></li></ul><p v-else>暂无文件，可添加一份 PDF 或 Markdown。</p></div>
             </template>
             <div v-else class="empty-inspector"><h2>选择一个条目</h2><p>在左侧查看文献元数据与附件。</p></div>
           </section>
         </section>
       </template>
 
-      <template v-else-if="activeTab === 'knowledge'">
-        <header class="page-header"><div><p class="eyebrow">Knowledge collections</p><h1>知识库管理</h1><p>按临床主题组织文献、知识块和经过审核的证据。</p></div><button type="button">＋ 新建知识库</button></header>
-        <section class="library-grid"><article v-for="library in libraries" :key="library.name" class="library-card" :class="library.tone"><span class="library-orb"></span><h2>{{ library.name }}</h2><p>{{ library.detail }}</p><button class="text-action" type="button">打开知识库 →</button></article></section>
+      <template v-else-if="activeTab === 'configurations'">
+        <header class="page-header configuration-header"><div><p class="eyebrow">Build registry</p><h1>方法与模型</h1><p>集中注册可复用的分块策略与嵌入模型，供知识库构建时选择。</p></div><div class="configuration-actions"><button class="soft-button" type="button" @click="openChunkingDialog"><svg aria-hidden="true" viewBox="0 0 24 24"><path d="M5 4h14v5H5zM5 15h6v5H5zM15 15h4v5h-4z"/></svg>注册分块方法</button><button type="button" @click="isEmbeddingDialogOpen = true"><svg aria-hidden="true" viewBox="0 0 24 24"><circle cx="12" cy="12" r="3"/><circle cx="5" cy="6" r="2"/><circle cx="19" cy="6" r="2"/><circle cx="5" cy="18" r="2"/><circle cx="19" cy="18" r="2"/><path d="m7 7 3 3m4 0 3-3m-7 7-3 3m7-3 3 3"/></svg>注册嵌入模型</button></div></header>
+        <section v-if="isConfigurationsLoading" class="data-state page-data-state" role="status"><span class="loading-ring"></span><p>正在读取方法与模型…</p></section>
+        <section v-else-if="configurationsLoadError" class="data-state page-data-state error" role="alert"><p>{{ configurationsLoadError }}</p><button type="button" @click="loadConfigurations">重新加载</button></section>
+        <section v-else class="registry-sections" aria-label="知识库构建配置">
+          <article class="registry-section">
+            <div class="registry-heading"><div><span class="registry-icon chunk-icon"><svg aria-hidden="true" viewBox="0 0 24 24"><path d="M5 4h14v5H5zM5 15h6v5H5zM15 15h4v5h-4z"/></svg></span><div><p class="eyebrow">Chunking methods</p><h2>分块方法</h2></div></div><span>{{ chunkingMethods.length }} 个</span></div>
+            <div v-if="chunkingMethods.length" class="registry-list">
+              <article v-for="method in chunkingMethods" :key="method.id" class="registry-row chunking-row"><div class="registry-row-main"><span class="method-swatch" :style="{ background: method.color }"></span><div><strong>{{ method.name }}</strong><p>{{ method.description || '暂无说明' }}</p></div></div><div class="registry-row-value"><small>策略</small><span>{{ strategyLabel(method.strategy) }}</span></div><div class="registry-row-value"><small>最大字符</small><span>{{ method.config.max_chars || '—' }}</span></div><div class="registry-row-value"><small>重叠字符</small><span>{{ method.config.overlap || 0 }}</span></div><button class="danger-link" type="button" :disabled="deletingConfigurationId === method.id" @click="deleteConfiguration('chunking-methods', method.id, method.name)">{{ deletingConfigurationId === method.id ? '删除中…' : '删除' }}</button></article>
+            </div>
+            <div v-else class="registry-empty">还没有分块方法，请先注册一个。</div>
+          </article>
+
+          <article class="registry-section">
+            <div class="registry-heading"><div><span class="registry-icon model-icon"><svg aria-hidden="true" viewBox="0 0 24 24"><circle cx="12" cy="12" r="3"/><circle cx="5" cy="6" r="2"/><circle cx="19" cy="6" r="2"/><circle cx="5" cy="18" r="2"/><circle cx="19" cy="18" r="2"/><path d="m7 7 3 3m4 0 3-3m-7 7-3 3m7-3 3 3"/></svg></span><div><p class="eyebrow">Embedding models</p><h2>嵌入模型</h2></div></div><span>{{ embeddingModels.length }} 个</span></div>
+            <div v-if="embeddingModels.length" class="registry-list">
+              <article v-for="model in embeddingModels" :key="model.id" class="registry-row model-row"><div class="registry-row-main"><span class="model-monogram">AI</span><div><strong>{{ model.name }}</strong><p>{{ model.model_name }}</p></div></div><div class="registry-row-value"><small>提供方</small><span>{{ providerLabel(model.provider) }}</span></div><div class="registry-row-value"><small>向量维度</small><span>{{ model.dimension ? `${model.dimension} 维` : '—' }}</span></div><div class="registry-row-value"><small>服务地址</small><span class="registry-url" :title="model.base_url || '本地模型缓存'">{{ model.base_url || '本地缓存' }}</span></div><span class="registry-actions"><button v-if="model.provider === 'medcpt'" class="text-action" type="button" :disabled="downloadingModelId === model.id" @click="downloadEmbeddingModel(model)">{{ downloadingModelId === model.id ? '排队中…' : '下载模型' }}</button><button class="danger-link" type="button" :disabled="deletingConfigurationId === model.id" @click="deleteConfiguration('embedding-models', model.id, model.name)">{{ deletingConfigurationId === model.id ? '删除中…' : '删除' }}</button></span></article>
+            </div>
+            <div v-else class="registry-empty">还没有嵌入模型，请先注册一个。</div>
+          </article>
+        </section>
       </template>
 
-      <template v-else>
-        <header class="page-header"><div><p class="eyebrow">Parsing queue</p><h1>解析任务</h1><p>跟踪 PDF 转换、章节恢复、分块与结构化抽取进度。</p></div><button type="button">刷新状态</button></header>
-        <section class="content task-panel"><div class="section-title"><div><p class="eyebrow">Active jobs</p><h2>当前任务</h2></div><span class="count">3 个任务</span></div><div class="task-list"><article v-for="task in tasks" :key="task.name"><div><h3>{{ task.name }}</h3><p>{{ task.parser }}</p></div><div class="progress"><i :style="{ width: task.progress }"></i></div><b>{{ task.progress }}</b><span class="tag">{{ task.state }}</span></article></div></section>
+      <template v-else-if="activeTab === 'knowledge'">
+        <section v-if="isKnowledgeBasesLoading" class="data-state page-data-state" role="status"><span class="loading-ring"></span><p>正在读取知识库…</p></section>
+        <section v-else-if="knowledgeBasesLoadError" class="data-state page-data-state error" role="alert"><p>{{ knowledgeBasesLoadError }}</p><button type="button" @click="loadKnowledgeBases()">重新加载</button></section>
+        <template v-else-if="!selectedKnowledgeBase">
+          <header class="page-header"><div><p class="eyebrow">Knowledge collections</p><h1>知识库管理</h1><p>只选择已经具有 MD 文本版本的文献，并绑定分块方法和嵌入模型。</p></div><button type="button" :disabled="!markdownReadyEntries.length || !chunkingMethods.length || !embeddingModels.length" @click="openKnowledgeDialog">＋ 新建知识库</button></header>
+          <div v-if="!chunkingMethods.length || !embeddingModels.length" class="configuration-callout"><div><strong>还需要完成构建配置</strong><p>新建知识库前，至少注册一个分块方法和一个嵌入模型。</p></div><button class="soft-button" type="button" @click="navigateTo('configurations')">前往方法与模型</button></div>
+          <section v-if="knowledgeBases.length" class="library-grid"><article v-for="library in knowledgeBases" :key="library.id" class="library-card" :style="{ '--method-color': library.chunkingMethod.color }"><span class="library-orb"></span><div class="library-card-top"><span>{{ library.status === 'configured' ? '已配置' : library.status }}</span><small>{{ library.documents.length }} 篇文献</small></div><h2>{{ library.name }}</h2><p>{{ library.description || '暂无知识库说明。' }}</p><dl><div><dt>分块</dt><dd><i :style="{ background: library.chunkingMethod.color }"></i>{{ library.chunkingMethod.name }}</dd></div><div><dt>嵌入</dt><dd>{{ library.embeddingModel.name }}</dd></div></dl><button class="text-action" type="button" @click="openKnowledgeBase(library)">打开知识库 →</button></article></section>
+          <section v-else class="knowledge-empty"><span class="registry-icon chunk-icon"><svg aria-hidden="true" viewBox="0 0 24 24"><path d="M4 5h7v14H4zM13 5h7v6h-7zM13 13h7v6h-7z"/></svg></span><h2>还没有知识库</h2><p>先准备 MD 文本，再选择分块方法和嵌入模型创建知识库。</p><button type="button" :disabled="!markdownReadyEntries.length || !chunkingMethods.length || !embeddingModels.length" @click="openKnowledgeDialog">新建知识库</button></section>
+        </template>
+
+        <template v-else>
+          <button class="back-link" type="button" @click="closeKnowledgeBase">← 返回知识库列表</button>
+          <header class="page-header knowledge-detail-header"><div><p class="eyebrow">Knowledge base</p><h1>{{ selectedKnowledgeBase.name }}</h1><p>{{ selectedKnowledgeBase.description || '暂无知识库说明。' }}</p></div><div class="knowledge-header-actions"><div class="knowledge-config-summary"><span><i :style="{ background: selectedKnowledgeBase.chunkingMethod.color }"></i>{{ selectedKnowledgeBase.chunkingMethod.name }}</span><span>{{ selectedKnowledgeBase.embeddingModel.name }}</span><span>{{ taskStatusLabel(selectedKnowledgeBase.status) }}</span></div><div class="knowledge-build-actions"><button type="button" :disabled="buildingKnowledgeBaseId === selectedKnowledgeBase.id || selectedKnowledgeBase.status === 'building'" @click="buildKnowledgeBase">{{ selectedKnowledgeBase.status === 'indexed' ? '重建向量索引' : selectedKnowledgeBase.status === 'building' ? '向量构建中…' : '构建向量索引' }}</button></div></div></header>
+          <form class="knowledge-search" role="search" @submit.prevent="searchKnowledgeBase"><label><span>MedCPT 语义检索</span><input v-model="knowledgeSearchQuery" type="search" placeholder="输入医学问题或检索词" :disabled="selectedKnowledgeBase.status !== 'indexed'" /></label><button type="submit" :disabled="selectedKnowledgeBase.status !== 'indexed' || isKnowledgeSearching || !knowledgeSearchQuery.trim()">{{ isKnowledgeSearching ? '检索中…' : '检索知识块' }}</button></form>
+          <section v-if="knowledgeSearchError || knowledgeSearchResults.length" class="knowledge-search-results" aria-live="polite"><p v-if="knowledgeSearchError" class="search-error" role="alert">{{ knowledgeSearchError }}</p><article v-for="hit in knowledgeSearchResults" :key="hit.chunk_id"><header><strong>{{ hit.document_title }}</strong><span>{{ Math.round(hit.score * 100) }}%</span></header><small>{{ hit.heading_path.join(' › ') || '正文' }}</small><p>{{ hit.content }}</p></article></section>
+          <section class="knowledge-workspace">
+            <section class="knowledge-documents" aria-label="知识库文献">
+              <div class="pane-heading"><div><p class="eyebrow">Included references</p><h2>加入的文献</h2></div><span>{{ selectedKnowledgeBase.documents.length }} 篇</span></div>
+              <button v-for="document in selectedKnowledgeBase.documents" :key="document.id" class="knowledge-document" :class="{ active: selectedKnowledgeDocument?.id === document.id }" type="button" @click="openKnowledgeDocument(document)"><span class="entry-icon"><svg aria-hidden="true" viewBox="0 0 24 24"><path d="M6 3h9l3 3v15H6z"/><path d="M15 3v4h4M9 12h6M9 16h5"/></svg></span><span><strong>{{ document.title }}</strong><small>{{ document.authors.join('、') || '未填写作者' }}<template v-if="document.year"> · {{ document.year }}</template></small></span><svg class="row-chevron" aria-hidden="true" viewBox="0 0 24 24"><path d="m9 6 6 6-6 6"/></svg></button>
+            </section>
+            <section class="chunk-viewer" aria-label="文献分块预览">
+              <template v-if="selectedKnowledgeDocument">
+                <div class="chunk-viewer-heading"><div><p class="eyebrow">Chunk preview</p><h2>{{ selectedKnowledgeDocument.title }}</h2></div><span><i :style="{ background: selectedKnowledgeBase.chunkingMethod.color }"></i>{{ strategyLabel(selectedKnowledgeBase.chunkingMethod.strategy) }}</span></div>
+                <div v-if="isChunkPreviewLoading" class="preview-state" role="status"><span class="loading-ring"></span><p>正在按所选方法生成分块预览…</p></div>
+                <div v-else-if="chunkPreviewError" class="preview-state error" role="alert"><p>{{ chunkPreviewError }}</p><button type="button" @click="openKnowledgeDocument(selectedKnowledgeDocument)">重新加载</button></div>
+                <div v-else-if="chunkPreview.length" class="chunk-list"><article v-for="chunk in chunkPreview" :key="chunk.index" class="chunk-block" :style="{ '--chunk-color': selectedKnowledgeBase.chunkingMethod.color }"><span>Chunk {{ String(chunk.index).padStart(2, '0') }}</span><div class="chunk-markdown" v-html="renderMarkdownHtml(chunk.content)"></div><small>字符 {{ chunk.char_start }}–{{ chunk.char_end }}</small></article></div>
+                <div v-else class="preview-state"><p>当前文献没有可用于分块预览的文本。</p></div>
+              </template>
+              <div v-else class="preview-state"><span class="registry-icon chunk-icon"><svg aria-hidden="true" viewBox="0 0 24 24"><path d="M5 4h14v5H5zM5 15h6v5H5zM15 15h4v5h-4z"/></svg></span><p>选择左侧文献，查看带颜色标识的分块结果。</p></div>
+            </section>
+          </section>
+        </template>
+      </template>
+
+      <template v-else-if="activeTab === 'tasks'">
+        <header class="page-header"><div><p class="eyebrow">Processing activity</p><h1>解析任务</h1><p>实时查看持久化任务的排队、解析、保存、完成和失败状态。</p></div><button type="button" :disabled="isTasksLoading" @click="loadTasks()">{{ isTasksLoading ? '刷新中…' : '刷新状态' }}</button></header>
+        <section class="content task-panel">
+          <div class="section-title"><div><p class="eyebrow">Persisted jobs</p><h2>真实处理记录</h2></div><div class="task-bulk-actions"><label v-if="removableTasks.length"><input type="checkbox" :checked="allRemovableTasksSelected" @change="toggleAllRemovableTasks" />全选可移除</label><button class="task-bulk-delete" type="button" :disabled="!selectedTaskIds.size || deletingTaskIds.size > 0" @click="deleteSelectedTasks">{{ deletingTaskIds.size ? '处理中…' : `移除所选（${selectedTaskIds.size}）` }}</button><span class="count">{{ tasks.length }} 条记录</span></div></div>
+          <div v-if="isTasksLoading" class="data-state" role="status"><span class="loading-ring"></span><p>正在读取处理记录…</p></div>
+          <div v-else-if="tasksLoadError" class="data-state error" role="alert"><p>{{ tasksLoadError }}</p><button type="button" @click="loadTasks()">重新加载</button></div>
+          <div v-else-if="tasks.length" class="task-list" aria-live="polite" aria-atomic="false"><article v-for="task in tasks" :key="task.id"><label v-if="isRemovableTask(task)" class="task-select"><input type="checkbox" :checked="selectedTaskIds.has(task.id)" :disabled="deletingTaskIds.has(task.id)" @change="toggleTaskSelection(task.id)" /><span class="visually-hidden">选择 {{ task.name }}</span></label><span v-else class="task-select-spacer" aria-hidden="true"></span><div class="task-copy"><h3>{{ task.name }}</h3><p>{{ task.operation }} · {{ task.processor }} · {{ formatDateTime(task.created_at) }}</p><small v-if="task.error_message" class="task-error" role="alert">{{ task.error_message }}</small><small v-else>{{ task.message || '处理记录已持久化' }}</small></div><div class="progress" :class="{ indeterminate: task.progress === null && ['queued', 'running', 'building'].includes(task.status) }" :aria-label="task.progress === null ? `${taskStatusLabel(task.status)}，进度暂不可确定` : `处理进度 ${task.progress}%`"><i :style="task.progress === null ? undefined : { width: `${task.progress}%` }"></i></div><b>{{ task.progress === null ? '处理中' : `${task.progress}%` }}</b><span class="tag" :class="`task-${task.status}`">{{ taskStatusLabel(task.status) }}</span><div class="task-row-actions"><button v-if="task.status === 'failed' && task.attempt_count < task.max_attempts" class="task-retry" type="button" :disabled="deletingTaskIds.has(task.id)" @click="retryTask(task)">重试</button><button v-if="isRemovableTask(task)" class="task-delete" type="button" :disabled="deletingTaskIds.has(task.id)" @click="deleteTask(task)">{{ deletingTaskIds.has(task.id) ? '处理中…' : task.id.startsWith('document-version:') ? '隐藏' : '删除' }}</button></div></article></div>
+          <div v-else class="data-state"><p>暂无已持久化的处理记录。上传 MD、执行 MinerU 转换或创建知识库后会显示在这里。</p></div>
+        </section>
       </template>
     </main>
+
+    <Teleport to="body">
+      <div v-if="isChunkingDialogOpen" class="dialog-backdrop" @click.self="closeChunkingDialog" @keydown.esc="closeChunkingDialog">
+        <section class="entry-dialog chunking-configuration-dialog" role="dialog" aria-modal="true" aria-labelledby="chunking-dialog-title">
+          <div class="dialog-heading"><div><p class="eyebrow">Chunking recipe</p><h2 id="chunking-dialog-title">注册分块方法</h2><p>选择后端切块引擎，配置一组可复用参数，并用真实 Markdown 文献验证结果。</p></div><button class="icon-button" type="button" aria-label="关闭注册分块方法窗口" :disabled="isSavingChunkingMethod" @click="closeChunkingDialog">×</button></div>
+          <nav class="configuration-steps" aria-label="分块方法注册步骤">
+            <button v-for="step in [{ number: 1, label: '基本信息与引擎' }, { number: 2, label: '分块规则' }, { number: 3, label: '样本预览' }]" :key="step.number" type="button" :class="{ active: chunkingStep === step.number, complete: chunkingStep > step.number }" :aria-current="chunkingStep === step.number ? 'step' : undefined" @click="goToChunkingStep(step.number)"><span>{{ chunkingStep > step.number ? '✓' : step.number }}</span>{{ step.label }}</button>
+          </nav>
+          <form @submit.prevent="registerChunkingMethod">
+            <section v-if="chunkingStep === 1" class="configuration-stage">
+              <div class="engine-explainer"><strong>什么是切块引擎？</strong><p>它是后端预先实现并验证过的文本切分算法。前端只选择引擎并保存参数，不上传或执行用户代码。</p></div>
+              <div class="form-grid"><label><span>显示名称 <b aria-hidden="true">*</b></span><input v-model.trim="chunkingForm.name" required maxlength="255" placeholder="如：指南标题递归分块" /></label><label><span>标识颜色</span><span class="color-field"><input v-model="chunkingForm.color" type="color" aria-label="分块标识颜色" /><code>{{ chunkingForm.color }}</code></span></label></div>
+              <fieldset class="engine-fieldset"><legend>选择切块引擎</legend><div class="engine-options">
+                <button type="button" :class="{ selected: chunkingForm.strategy === 'heading' }" @click="chunkingForm.strategy = 'heading'"><span class="engine-icon">H</span><span><strong>Markdown 标题</strong><small>按 H1–H6 章节组织，过长章节再递归切分；适合结构化指南。</small></span><i>{{ chunkingForm.strategy === 'heading' ? '已选择' : '推荐' }}</i></button>
+                <button type="button" :class="{ selected: chunkingForm.strategy === 'recursive' }" @click="chunkingForm.strategy = 'recursive'"><span class="engine-icon">¶</span><span><strong>递归边界</strong><small>优先在段落、句号和换行处切开；适合标题不规范的正文。</small></span><i>{{ chunkingForm.strategy === 'recursive' ? '已选择' : '通用' }}</i></button>
+                <button type="button" :class="{ selected: chunkingForm.strategy === 'fixed' }" @click="chunkingForm.strategy = 'fixed'"><span class="engine-icon">≡</span><span><strong>固定长度</strong><small>按字符窗口稳定切分并保留重叠；适合基准测试和可复现实验。</small></span><i>{{ chunkingForm.strategy === 'fixed' ? '已选择' : '基准' }}</i></button>
+              </div></fieldset>
+              <label class="full-field"><span>使用说明</span><textarea v-model.trim="chunkingForm.description" rows="3" placeholder="记录适用文献、预期效果或版本说明"></textarea></label>
+            </section>
+
+            <section v-else-if="chunkingStep === 2" class="configuration-stage">
+              <div class="stage-heading"><div><p class="eyebrow">Rules</p><h3>控制块大小与上下文连续性</h3></div><span>{{ strategyLabel(chunkingForm.strategy) }}</span></div>
+              <div class="parameter-grid">
+                <label><span>目标字符数</span><input v-model.number="chunkingForm.targetChars" type="number" min="100" max="10000" required /><small>引擎优先生成的块大小。</small></label>
+                <label><span>最大字符数</span><input v-model.number="chunkingForm.maxChars" type="number" min="100" max="20000" required /><small>单个块不可超过的硬上限。</small></label>
+                <label><span>最小字符数</span><input v-model.number="chunkingForm.minChars" type="number" min="0" max="5000" required /><small>短章节可与前一块合并。</small></label>
+                <label><span>重叠字符数</span><input v-model.number="chunkingForm.overlap" type="number" min="0" :max="Math.floor(chunkingForm.maxChars / 2) - 1" required /><small>相邻块之间保留的上下文。</small></label>
+                <label><span>最多生成块数</span><input v-model.number="chunkingForm.maxChunks" type="number" min="1" max="10000" required /><small>防止异常文档无限切分。</small></label>
+              </div>
+              <section v-if="chunkingForm.strategy === 'heading'" class="heading-level-panel"><div><strong>参与切分的标题层级</strong><small>只把选中的 Markdown 标题视为章节边界。</small></div><div class="heading-levels"><button v-for="level in 6" :key="level" type="button" :class="{ selected: chunkingForm.headingLevels.includes(level) }" :aria-pressed="chunkingForm.headingLevels.includes(level)" @click="toggleHeadingLevel(level)">H{{ level }}</button></div></section>
+              <div class="rule-switches">
+                <label><input v-model="chunkingForm.mergeShortSections" type="checkbox" /><span><strong>合并过短章节</strong><small>短于最小字符数时尝试并入前一块。</small></span></label>
+                <label><input v-model="chunkingForm.prependHeadingPath" type="checkbox" /><span><strong>嵌入文本携带标题路径</strong><small>检索向量保留“章 › 节”上下文，展示正文不重复标题。</small></span></label>
+                <label><input v-model="chunkingForm.preserveTables" type="checkbox" /><span><strong>尽量保持表格完整</strong><small>避免在 Markdown 表格行中间切断。</small></span></label>
+                <label><input v-model="chunkingForm.preserveCodeBlocks" type="checkbox" /><span><strong>尽量保持代码块完整</strong><small>避免在围栏代码块中间切断。</small></span></label>
+              </div>
+            </section>
+
+            <section v-else class="configuration-stage preview-stage">
+              <div class="stage-heading"><div><p class="eyebrow">Dry run</p><h3>使用真实 MD 检查分块结果</h3></div><span>注册前必做</span></div>
+              <div v-if="markdownReadyEntries.length" class="preview-controls"><label><span>样本文献</span><select v-model="chunkingPreviewDocumentId"><option v-for="entry in markdownReadyEntries" :key="entry.id" :value="entry.id">{{ entry.title }}</option></select></label><button type="button" :disabled="isChunkingPreviewLoading" @click="previewChunkingMethod">{{ isChunkingPreviewLoading ? '生成中…' : chunkingPreview.length ? '重新生成预览' : '生成预览' }}</button></div>
+              <div v-else class="preview-empty"><strong>还没有可用的 Markdown 文献</strong><p>请先在文献管理上传 MD，或用 MinerU 将 PDF 转为 MD。</p></div>
+              <div v-if="isChunkingPreviewLoading" class="preview-state compact" role="status"><span class="loading-ring"></span><p>正在执行 {{ strategyLabel(chunkingForm.strategy) }}…</p></div>
+              <div v-else-if="chunkingPreviewError" class="preview-state compact error" role="alert"><p>{{ chunkingPreviewError }}</p></div>
+              <template v-else-if="chunkingPreviewStats">
+                <dl class="preview-stat-grid"><div><dt>分块总数</dt><dd>{{ chunkingPreviewStats.total }}</dd></div><div><dt>平均长度</dt><dd>{{ chunkingPreviewStats.average_chars }}</dd></div><div><dt>最短 / 最长</dt><dd>{{ chunkingPreviewStats.minimum_chars }} / {{ chunkingPreviewStats.maximum_chars }}</dd></div><div><dt>超出范围</dt><dd>{{ chunkingPreviewStats.too_short + chunkingPreviewStats.too_long }}</dd></div></dl>
+                <div class="recipe-preview-list"><article v-for="chunk in chunkingPreview" :key="chunk.index" :style="{ '--preview-color': chunkingForm.color }"><header><span>Chunk {{ String(chunk.index).padStart(2, '0') }}</span><small>{{ chunk.char_count }} 字符</small></header><p v-if="chunk.heading_path.length" class="chunk-breadcrumb">{{ chunk.heading_path.join(' › ') }}</p><div class="chunk-markdown compact" v-html="renderMarkdownHtml(chunk.content)"></div></article></div>
+              </template>
+              <div v-else-if="markdownReadyEntries.length" class="preview-empty subtle"><strong>参数尚未验证</strong><p>点击“生成预览”，确认块大小、标题路径和内容边界符合预期。</p></div>
+            </section>
+
+            <div class="dialog-actions configuration-footer"><button class="soft-button" type="button" :disabled="isSavingChunkingMethod" @click="chunkingStep === 1 ? closeChunkingDialog() : goToChunkingStep(chunkingStep - 1)">{{ chunkingStep === 1 ? '取消' : '上一步' }}</button><span>第 {{ chunkingStep }} / 3 步</span><button v-if="chunkingStep < 3" type="button" @click="goToChunkingStep(chunkingStep + 1)">下一步</button><button v-else type="submit" :disabled="isSavingChunkingMethod || !chunkingPreviewStats">{{ isSavingChunkingMethod ? '正在注册…' : '保存分块方法' }}</button></div>
+          </form>
+        </section>
+      </div>
+    </Teleport>
+
+    <Teleport to="body">
+      <div v-if="isEmbeddingDialogOpen" class="dialog-backdrop" @click.self="closeEmbeddingDialog" @keydown.esc="closeEmbeddingDialog">
+        <section class="entry-dialog configuration-dialog" role="dialog" aria-modal="true" aria-labelledby="embedding-dialog-title">
+          <div class="dialog-heading"><div><p class="eyebrow">Register model</p><h2 id="embedding-dialog-title">注册嵌入模型</h2><p>填写模型标识与调用地址，供知识库构建时复用。</p></div><button class="icon-button" type="button" aria-label="关闭注册嵌入模型窗口" :disabled="isSavingEmbeddingModel" @click="closeEmbeddingDialog">×</button></div>
+          <form @submit.prevent="registerEmbeddingModel">
+            <label class="full-field"><span>显示名称 <b aria-hidden="true">*</b></span><input v-model.trim="embeddingForm.name" required maxlength="255" placeholder="如：BGE-M3 本地服务" /></label>
+            <div class="form-grid"><label><span>提供方</span><select v-model="embeddingForm.provider"><option value="medcpt">MedCPT 本地双编码器</option><option value="local">本地兼容服务</option><option value="openai">OpenAI 兼容</option></select></label><label><span>向量维度</span><input v-model.number="embeddingForm.dimension" type="number" min="1" placeholder="768" :disabled="embeddingForm.provider === 'medcpt'" /></label></div>
+            <label class="full-field"><span>文献编码器 <b aria-hidden="true">*</b></span><input v-model.trim="embeddingForm.modelName" required maxlength="512" placeholder="ncbi/MedCPT-Article-Encoder" :disabled="embeddingForm.provider === 'medcpt'" /></label>
+            <label class="full-field"><span>服务地址</span><input v-model.trim="embeddingForm.baseUrl" type="url" placeholder="远程兼容服务可填写" :disabled="embeddingForm.provider === 'medcpt'" /></label>
+            <p v-if="embeddingForm.provider === 'medcpt'" class="embedding-note">查询使用 ncbi/MedCPT-Query-Encoder，文献分块使用 ncbi/MedCPT-Article-Encoder；注册后点击“下载模型”。</p>
+            <div class="dialog-actions"><button class="soft-button" type="button" :disabled="isSavingEmbeddingModel" @click="closeEmbeddingDialog">取消</button><button type="submit" :disabled="isSavingEmbeddingModel">{{ isSavingEmbeddingModel ? '正在注册…' : '确认注册' }}</button></div>
+          </form>
+        </section>
+      </div>
+    </Teleport>
+
+    <Teleport to="body">
+      <div v-if="isKnowledgeDialogOpen" class="dialog-backdrop" @click.self="closeKnowledgeDialog" @keydown.esc="closeKnowledgeDialog">
+        <section class="entry-dialog knowledge-dialog" role="dialog" aria-modal="true" aria-labelledby="knowledge-dialog-title">
+          <div class="dialog-heading"><div><p class="eyebrow">New knowledge base</p><h2 id="knowledge-dialog-title">新建知识库</h2><p>依次选择内容与构建配置，创建后仍可查看每篇文献的分块结果。</p></div><button class="icon-button" type="button" aria-label="关闭新建知识库窗口" :disabled="isSavingKnowledgeBase" @click="closeKnowledgeDialog">×</button></div>
+          <form @submit.prevent="createKnowledgeBase">
+            <section class="build-step"><div class="build-step-title"><span>1</span><div><strong>基本信息</strong><small>用于识别知识库的主题与范围</small></div></div><label class="full-field"><span>知识库名称 <b aria-hidden="true">*</b></span><input v-model.trim="knowledgeForm.name" required maxlength="255" placeholder="如：脑出血急性期治疗证据库" /></label><label class="full-field"><span>说明</span><textarea v-model.trim="knowledgeForm.description" rows="2" placeholder="简要描述收录范围和用途"></textarea></label></section>
+            <section class="build-step"><div class="build-step-title"><span>2</span><div><strong>选择 MD 文献</strong><small>这里只显示已经上传或通过 MinerU 生成 MD 的条目</small></div><em>{{ knowledgeForm.documentIds.length }} 篇已选</em></div><div class="document-choice-list"><label v-for="entry in markdownReadyEntries" :key="entry.id" class="document-choice" :class="{ selected: knowledgeForm.documentIds.includes(entry.id) }"><input v-model="knowledgeForm.documentIds" type="checkbox" :value="entry.id" /><span class="entry-icon"><svg aria-hidden="true" viewBox="0 0 24 24"><path d="M6 3h9l3 3v15H6z"/><path d="M15 3v4h4M9 12h6M9 16h5"/></svg></span><span><strong>{{ entry.title }}</strong><small>{{ entry.authors.join('、') || '未填写作者' }} · MD 已就绪</small></span></label></div></section>
+            <section class="build-step"><div class="build-step-title"><span>3</span><div><strong>构建配置</strong><small>指定分块方法与向量嵌入模型</small></div></div><div class="build-config-grid"><label><span>分块方法 <b aria-hidden="true">*</b></span><select v-model="knowledgeForm.chunkingMethodId" required><option value="" disabled>请选择分块方法</option><option v-for="method in chunkingMethods" :key="method.id" :value="method.id">{{ method.name }}</option></select></label><label><span>嵌入模型 <b aria-hidden="true">*</b></span><select v-model="knowledgeForm.embeddingModelId" required><option value="" disabled>请选择嵌入模型</option><option v-for="model in embeddingModels" :key="model.id" :value="model.id">{{ model.name }}</option></select></label></div></section>
+            <div class="dialog-actions"><button class="soft-button" type="button" :disabled="isSavingKnowledgeBase" @click="closeKnowledgeDialog">取消</button><button type="submit" :disabled="isSavingKnowledgeBase || !knowledgeForm.documentIds.length">{{ isSavingKnowledgeBase ? '正在创建…' : '创建知识库' }}</button></div>
+          </form>
+        </section>
+      </div>
+    </Teleport>
 
     <Teleport to="body">
       <div v-if="isCreateDialogOpen" class="dialog-backdrop" @click.self="closeCreateDialog" @keydown.esc="closeCreateDialog">
@@ -593,15 +1719,15 @@ onMounted(() => {
     <Teleport to="body">
       <div v-if="isUploadDialogOpen" class="dialog-backdrop" @click.self="closeUploadDialog" @keydown.esc="closeUploadDialog">
         <section class="entry-dialog upload-dialog" role="dialog" aria-modal="true" aria-labelledby="upload-title">
-          <div class="dialog-heading"><div><p class="eyebrow">Import attachments</p><h2 id="upload-title">添加文件</h2><p>支持 PDF 和 Markdown，可一次选择多个文件。</p></div><button class="icon-button" type="button" aria-label="关闭添加文件窗口" @click="closeUploadDialog">×</button></div>
-          <div class="upload-step-heading"><span>1</span><div><strong>选择文件</strong><small>可一次添加多个 PDF 或 Markdown 文件</small></div></div>
+          <div class="dialog-heading"><div><p class="eyebrow">Import attachments</p><h2 id="upload-title">添加文件</h2><p>支持批量选择 PDF 和 Markdown；每个条目只保留一份 PDF 与一份 MD。</p></div><button class="icon-button" type="button" aria-label="关闭添加文件窗口" @click="closeUploadDialog">×</button></div>
+          <div class="upload-step-heading"><span>1</span><div><strong>选择文件</strong><small>新建模式下每个文件生成独立条目；已有条目最多选择一份 PDF 和一份 MD</small></div></div>
           <input ref="uploadInput" class="visually-hidden" type="file" accept="application/pdf,text/markdown,.pdf,.md" multiple @change="onUploadFiles" />
           <button class="file-picker" type="button" @click="chooseUploadFiles"><svg aria-hidden="true" viewBox="0 0 24 24"><path d="M12 16V4M7 9l5-5 5 5"/><path d="M5 14v5h14v-5"/></svg><span><strong>{{ selectedUploadFiles.length ? '继续选择文件' : '选择 PDF 或 Markdown' }}</strong><small>单个文件不超过 100 MB</small></span></button>
           <ul v-if="selectedUploadFiles.length" class="selected-files" aria-label="待上传文件"><li v-for="(file, index) in selectedUploadFiles" :key="`${file.name}-${file.size}`"><span class="pdf-icon" :class="{ markdown: file.name.toLowerCase().endsWith('.md') }">{{ file.name.toLowerCase().endsWith('.md') ? 'MD' : 'PDF' }}</span><span><strong>{{ file.name }}</strong><small>{{ formatFileSize(file.size) }}</small></span><button type="button" :aria-label="`移除 ${file.name}`" @click="removeUploadFile(index)">×</button></li></ul>
           <div class="upload-step-heading destination-heading"><span>2</span><div><strong>选择保存位置</strong><small>创建新条目，或添加到现有文献条目</small></div></div>
           <div class="upload-destination" role="group" aria-label="文件保存位置">
-            <button class="upload-choice" :class="{ selected: uploadDestination === 'new' }" type="button" :aria-pressed="uploadDestination === 'new'" @click="setUploadDestination('new')"><span class="choice-indicator"><svg v-if="uploadDestination === 'new'" aria-hidden="true" viewBox="0 0 24 24"><path d="m7 12 3 3 7-7"/></svg></span><span><strong>创建新条目</strong><small>每个文件创建一个条目，PDF 自动识别元数据。</small></span></button>
-            <button class="upload-choice" :class="{ selected: uploadDestination === 'existing' }" type="button" :aria-pressed="uploadDestination === 'existing'" :disabled="!entries.length" @click="setUploadDestination('existing')"><span class="choice-indicator"><svg v-if="uploadDestination === 'existing'" aria-hidden="true" viewBox="0 0 24 24"><path d="m7 12 3 3 7-7"/></svg></span><span><strong>添加到已有条目</strong><small>{{ entries.length ? '全部文件作为附件添加到同一个条目。' : '暂无可用条目，请先创建新条目。' }}</small></span></button>
+            <button class="upload-choice" :class="{ selected: uploadDestination === 'new' }" type="button" :aria-pressed="uploadDestination === 'new'" @click="setUploadDestination('new')"><span class="choice-indicator"><svg v-if="uploadDestination === 'new'" aria-hidden="true" viewBox="0 0 24 24"><path d="m7 12 3 3 7-7"/></svg></span><span><strong>创建新条目</strong><small>每个文件创建一个条目，条目名默认使用文件名。</small></span></button>
+            <button class="upload-choice" :class="{ selected: uploadDestination === 'existing' }" type="button" :aria-pressed="uploadDestination === 'existing'" :disabled="!entries.length" @click="setUploadDestination('existing')"><span class="choice-indicator"><svg v-if="uploadDestination === 'existing'" aria-hidden="true" viewBox="0 0 24 24"><path d="m7 12 3 3 7-7"/></svg></span><span><strong>添加到已有条目</strong><small>{{ entries.length ? '同类型文件已存在时，会在上传前询问是否替代。' : '暂无可用条目，请先创建新条目。' }}</small></span></button>
           </div>
           <label v-if="uploadDestination === 'existing'" class="full-field target-field"><span>目标条目</span><select v-model="uploadTargetId"><option value="" disabled>请选择条目</option><option v-for="entry in entries" :key="entry.id" :value="entry.id">{{ entry.title }}</option></select></label>
           <div class="dialog-actions"><button class="soft-button" type="button" :disabled="isUploading" @click="closeUploadDialog">取消</button><button type="button" :disabled="isUploading || !selectedUploadFiles.length" @click="submitUpload">{{ isUploading ? '正在上传并识别…' : selectedUploadFiles.length ? `上传 ${selectedUploadFiles.length} 个文件` : '开始上传' }}</button></div>

@@ -1,6 +1,8 @@
+from types import SimpleNamespace
+
 import pytest
 
-from app.api.knowledge_bases import build_chunk_preview
+from app.api.knowledge_bases import _dedupe_chunk_rows, build_chunk_preview
 from app.services.chunking import build_chunks
 
 
@@ -74,3 +76,17 @@ def test_recursive_chunking_keeps_fenced_code_together_when_possible() -> None:
 def test_unregistered_semantic_engine_is_rejected() -> None:
     with pytest.raises(ValueError, match="不支持的切块引擎"):
         build_chunks("测试文本", "semantic", {})
+
+
+def test_legacy_chunk_snapshots_are_deduplicated_by_index() -> None:
+    rows = [
+        SimpleNamespace(chunk_index=1, index_version="initial"),
+        SimpleNamespace(chunk_index=2, index_version="initial"),
+        SimpleNamespace(chunk_index=1, index_version="rebuilt"),
+        SimpleNamespace(chunk_index=2, index_version="rebuilt"),
+    ]
+
+    deduped = _dedupe_chunk_rows(rows)
+
+    assert [row.chunk_index for row in deduped] == [1, 2]
+    assert [row.index_version for row in deduped] == ["rebuilt", "rebuilt"]

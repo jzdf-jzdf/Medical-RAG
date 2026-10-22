@@ -77,6 +77,16 @@ def build_chunk_preview(text: str, strategy: str, config: dict) -> list[ChunkPre
     return [_chunk_item(chunk) for chunk in chunks]
 
 
+def _dedupe_chunk_rows(chunks: list[Chunk]) -> list[Chunk]:
+    """Keep one row per index for legacy snapshots that predate index versions."""
+
+    latest: dict[int, Chunk] = {}
+    for chunk in chunks:
+        if chunk.chunk_index is not None:
+            latest[chunk.chunk_index] = chunk
+    return [latest[index] for index in sorted(latest)]
+
+
 def _chunk_item(chunk: ChunkResult) -> ChunkPreviewItem:
     return ChunkPreviewItem(
         index=chunk.index,
@@ -537,18 +547,29 @@ async def preview_document_chunks(
     if collection.chunking_method is None:
         raise HTTPException(status_code=409, detail="知识库尚未配置分块方法")
 
-    persisted = list(
-        (
-            await db.scalars(
-                select(Chunk)
-                .where(
-                    Chunk.collection_id == collection.id,
-                    Chunk.document_id == document.id,
-                )
-                .order_by(Chunk.chunk_index)
-            )
-        ).all()
+    # Chunk rows are snapshots: every rebuild keeps the previous rows for
+    # blue-green rollback. Readers must therefore select the active snapshot,
+    # otherwise a rebuilt collection returns each chunk once per build.
+    active_version = await db.scalar(
+        select(IndexVersion.version)
+        .where(
+            IndexVersion.collection_id == collection.id,
+            IndexVersion.status == "active",
+        )
+        .order_by(IndexVersion.created_at.desc())
+        .limit(1)
     )
+    chunk_query = select(Chunk).where(
+        Chunk.collection_id == collection.id,
+        Chunk.document_id == document.id,
+    )
+    if active_version:
+        chunk_query = chunk_query.where(Chunk.index_version == active_version)
+    persisted = list(
+        (await db.scalars(chunk_query.order_by(Chunk.chunk_index))).all()
+    )
+    if not active_version:
+        persisted = _dedupe_chunk_rows(persisted)
     if persisted:
         chunks = [
             ChunkPreviewItem(

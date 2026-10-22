@@ -4,10 +4,16 @@ from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from sqlalchemy import text
 
+from app.api.chat import router as chat_router
 from app.api.conversations import router as conversations_router
+from app.api.governance import router as governance_router
 from app.api.meta import router as meta_router
+from app.api.models import router as models_router
+from app.api.runs import router as runs_router
 from app.core.config import get_settings
+from app.core.security import authorize_request
 from app.db.session import engine
+from app.services.observability import instrument, metrics_app
 
 settings = get_settings()
 
@@ -27,8 +33,15 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+app.middleware("http")(instrument("medical-agent-api"))
+app.mount("/metrics", metrics_app())
+app.middleware("http")(authorize_request)
 app.include_router(conversations_router, prefix="/api/v1")
+app.include_router(chat_router, prefix="/api/v1")
 app.include_router(meta_router, prefix="/api/v1")
+app.include_router(models_router, prefix="/api/v1")
+app.include_router(governance_router, prefix="/api/v1")
+app.include_router(runs_router, prefix="/api/v1")
 
 
 @app.get("/health", tags=["health"])

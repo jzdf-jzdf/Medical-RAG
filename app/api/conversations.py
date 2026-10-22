@@ -1,12 +1,13 @@
 import uuid
 
-from fastapi import APIRouter, Depends, Header, HTTPException, Query, status
-from sqlalchemy import func, select
+from fastapi import APIRouter, Depends, Header, HTTPException, Query, Request, Response, status
+from sqlalchemy import delete, func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 
+from app.core.security import enforce_user
 from app.db.session import get_db
-from app.models import Conversation
+from app.models import AgentRun, AnswerCitation, Conversation, Message
 from app.schemas.conversations import (
     ConversationCreate,
     ConversationDetail,
@@ -19,8 +20,9 @@ router = APIRouter(prefix="/conversations", tags=["conversations"])
 
 @router.post("", response_model=ConversationRead, status_code=status.HTTP_201_CREATED)
 async def create_conversation(
-    payload: ConversationCreate, db: AsyncSession = Depends(get_db)
+    payload: ConversationCreate, request: Request, db: AsyncSession = Depends(get_db)
 ) -> Conversation:
+    enforce_user(request, payload.user_id, "editor")
     conversation = Conversation(**payload.model_dump())
     db.add(conversation)
     await db.commit()
@@ -30,11 +32,13 @@ async def create_conversation(
 
 @router.get("", response_model=ConversationList)
 async def list_conversations(
+    request: Request,
     user_id: str = Header(alias="X-User-ID"),
     page: int = Query(1, ge=1),
     page_size: int = Query(20, ge=1, le=100),
     db: AsyncSession = Depends(get_db),
 ) -> ConversationList:
+    enforce_user(request, user_id)
     predicate = Conversation.user_id == user_id
     total = int(
         (await db.scalar(select(func.count()).select_from(Conversation).where(predicate))) or 0
@@ -56,9 +60,11 @@ async def list_conversations(
 @router.get("/{conversation_id}", response_model=ConversationDetail)
 async def get_conversation(
     conversation_id: uuid.UUID,
+    request: Request,
     user_id: str = Header(alias="X-User-ID"),
     db: AsyncSession = Depends(get_db),
 ) -> Conversation:
+    enforce_user(request, user_id)
     conversation = await db.scalar(
         select(Conversation)
         .options(selectinload(Conversation.messages))
@@ -69,3 +75,27 @@ async def get_conversation(
     if conversation.user_id != user_id:
         raise HTTPException(status_code=403, detail="Conversation access denied")
     return conversation
+
+
+@router.delete("/{conversation_id}", status_code=status.HTTP_204_NO_CONTENT)
+async def delete_conversation(
+    conversation_id: uuid.UUID,
+    request: Request,
+    user_id: str = Header(alias="X-User-ID"),
+    db: AsyncSession = Depends(get_db),
+) -> Response:
+    enforce_user(request, user_id, "editor")
+    conversation = await db.get(Conversation, conversation_id)
+    if conversation is None:
+        raise HTTPException(status_code=404, detail="Conversation not found")
+    if conversation.user_id != user_id:
+        raise HTTPException(status_code=403, detail="Conversation access denied")
+
+    message_ids = select(Message.id).where(Message.conversation_id == conversation_id)
+    await db.execute(
+        delete(AnswerCitation).where(AnswerCitation.message_id.in_(message_ids))
+    )
+    await db.execute(delete(AgentRun).where(AgentRun.conversation_id == conversation_id))
+    await db.delete(conversation)
+    await db.commit()
+    return Response(status_code=status.HTTP_204_NO_CONTENT)

@@ -28,6 +28,9 @@ class ChatRequest(BaseModel):
     user_id: str
     content: str = Field(min_length=1)
     model_profile: str | None = None
+    model_config_id: str | None = None
+    collection_id: str | None = None
+    retrieval_top_k: int = Field(default=8, ge=1, le=20)
 
 
 class ChatResponse(BaseModel):
@@ -36,6 +39,12 @@ class ChatResponse(BaseModel):
     content: str
     citations: list[dict]
     degraded_without_evidence: bool
+    model: str
+    provider: str
+    tool_calls: list[dict] = Field(default_factory=list)
+    verification: dict = Field(default_factory=dict)
+    trace: list[dict] = Field(default_factory=list)
+    links: dict[str, str] = Field(default_factory=dict)
 
 
 class CitationCandidate(BaseModel):

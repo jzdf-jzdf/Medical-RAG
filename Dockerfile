@@ -1,10 +1,13 @@
 FROM python:3.12-slim
 WORKDIR /app
 COPY pyproject.toml ./
+RUN mkdir -p app \
+    && touch app/__init__.py \
+    && pip install --no-cache-dir . \
+    && rm -rf app
 COPY app ./app
 COPY alembic.ini ./
 COPY migrations ./migrations
-RUN pip install --no-cache-dir .
 EXPOSE 8002
 CMD ["sh", "-c", "alembic upgrade head && uvicorn app.main:app --host 0.0.0.0 --port 8002"]
 

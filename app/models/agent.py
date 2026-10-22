@@ -49,6 +49,8 @@ class AgentRun(Base):
     skill_version: Mapped[str] = mapped_column(String(128))
     status: Mapped[str] = mapped_column(String(32), index=True)
     degraded_without_evidence: Mapped[bool] = mapped_column(Boolean, default=False)
+    trace: Mapped[list] = mapped_column(JSONB, default=list)
+    verification: Mapped[dict] = mapped_column(JSONB, default=dict)
     started_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
     finished_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
 
@@ -100,3 +102,25 @@ class AgentSkill(Base):
     system_prompt: Mapped[str] = mapped_column(Text)
     config: Mapped[dict] = mapped_column(JSONB, default=dict)
     enabled: Mapped[bool] = mapped_column(Boolean, default=True)
+
+
+class UsageQuota(Base):
+    __tablename__ = "usage_quotas"
+    user_id: Mapped[str] = mapped_column(String(255), primary_key=True)
+    daily_limit: Mapped[int] = mapped_column(Integer)
+    used_count: Mapped[int] = mapped_column(Integer, default=0)
+    usage_date: Mapped[str] = mapped_column(String(10))
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), onupdate=func.now()
+    )
+
+
+class AuditEvent(Base):
+    __tablename__ = "audit_events"
+    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    user_id: Mapped[str] = mapped_column(String(255), index=True)
+    action: Mapped[str] = mapped_column(String(128), index=True)
+    resource_type: Mapped[str] = mapped_column(String(128))
+    resource_id: Mapped[str | None] = mapped_column(String(255))
+    detail: Mapped[dict] = mapped_column(JSONB, default=dict)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())

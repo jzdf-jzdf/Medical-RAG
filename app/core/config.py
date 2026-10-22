@@ -20,6 +20,7 @@ class MCPServerSettings(BaseModel):
     transport: Literal["stdio", "sse", "streamable-http"]
     command: str | None = None
     args: list[str] = []
+    env: dict[str, str] = Field(default_factory=dict)
     url: HttpUrl | None = None
     enabled: bool = True
     timeout_seconds: float = Field(default=30, gt=0, le=300)
@@ -51,6 +52,9 @@ class Settings(BaseSettings):
     model_api_key: SecretStr = SecretStr("")
     model_max_tokens: int = Field(default=4096, ge=1)
     model_temperature: float = Field(default=0.2, ge=0, le=2)
+    model_encryption_key: str = ""
+    harness_provider: str = "deepseek-official"
+    dsh_home: Path = Path("./runtime/dsh_home")
     model_profiles_json: dict = {}
     default_model_profile: str = "default"
     mcp_servers_json: list[MCPServerSettings] = []
@@ -58,6 +62,12 @@ class Settings(BaseSettings):
     conversation_ttl_hours: int = Field(default=24, ge=1)
     workspace_root: Path = Path("./runtime")
     request_timeout_seconds: int = Field(default=120, ge=1, le=600)
+    max_tool_rounds: int = Field(default=4, ge=1, le=10)
+    default_knowledge_base_id: str = ""
+    retrieval_top_k: int = Field(default=8, ge=1, le=50)
+    daily_request_quota: int = Field(default=100, ge=1, le=100000)
+    auth_enabled: bool = False
+    api_keys_json: dict = {}
 
     @field_validator("allowed_origins", mode="before")
     @classmethod
@@ -68,7 +78,7 @@ class Settings(BaseSettings):
             else value
         )
 
-    @field_validator("mcp_servers_json", "model_profiles_json", mode="before")
+    @field_validator("mcp_servers_json", "model_profiles_json", "api_keys_json", mode="before")
     @classmethod
     def parse_json(cls, value: object) -> object:
         return json.loads(value) if isinstance(value, str) else value

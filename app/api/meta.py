@@ -9,8 +9,8 @@ from app.models import AgentSkill
 router = APIRouter(tags=["metadata"])
 
 
-@router.get("/models")
-async def models() -> dict:
+@router.get("/model-profiles")
+async def model_profiles() -> dict:
     settings = get_settings()
     profiles = [
         {"name": "default", "provider": settings.model_provider, "model": settings.model_name}

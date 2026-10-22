@@ -20,13 +20,46 @@ services:
     environment:
       APP_ENV: development
       DATABASE_URL: postgresql+asyncpg://knowledge:knowledge@knowledge-db:5432/knowledge_db
-      ALLOWED_ORIGINS: http://localhost:8080
+      ALLOWED_ORIGINS: '["http://localhost:8080"]'
       WORKSPACE_ROOT: /data
       QDRANT_URL: http://qdrant:6333
+      TASK_WORKER_ENABLED: "false"
+      RERANKER_MODEL: ${RERANKER_MODEL:-}
+      MEDCPT_CACHE_DIR: /data/models/medcpt
     volumes:
       - knowledge-files:/data
+      - type: bind
+        source: ${USERPROFILE}/.mineru
+        target: /root/.mineru
     depends_on:
       knowledge-db:
+        condition: service_healthy
+      qdrant:
+        condition: service_started
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8001/ready')"]
+      interval: 5s
+      timeout: 3s
+      retries: 30
+
+  knowledge-worker:
+    build: ../medical-knowledge-api
+    command: ["python", "-m", "app.worker"]
+    environment:
+      APP_ENV: development
+      DATABASE_URL: postgresql+asyncpg://knowledge:knowledge@knowledge-db:5432/knowledge_db
+      WORKSPACE_ROOT: /data
+      QDRANT_URL: http://qdrant:6333
+      RERANKER_MODEL: ${RERANKER_MODEL:-}
+      TASK_WORKER_ENABLED: "true"
+      MEDCPT_CACHE_DIR: /data/models/medcpt
+    volumes:
+      - knowledge-files:/data
+      - type: bind
+        source: ${USERPROFILE}/.mineru
+        target: /root/.mineru
+    depends_on:
+      knowledge-api:
         condition: service_healthy
       qdrant:
         condition: service_started
@@ -36,13 +69,18 @@ services:
     environment:
       APP_ENV: development
       DATABASE_URL: postgresql+asyncpg://agent:agent@agent-db:5432/agent_db
-      ALLOWED_ORIGINS: http://localhost:8080
+      ALLOWED_ORIGINS: '["http://localhost:8080"]'
       MODEL_PROVIDER: ${MODEL_PROVIDER:-deepseek}
       MODEL_NAME: ${MODEL_NAME:-deepseek-chat}
       MODEL_BASE_URL: ${MODEL_BASE_URL:-https://api.deepseek.com}
       MODEL_API_KEY: ${MODEL_API_KEY:-}
+      MODEL_ENCRYPTION_KEY: ${MODEL_ENCRYPTION_KEY:-}
       MCP_SERVERS_JSON: ${MCP_SERVERS_JSON:-[]}
       WORKSPACE_ROOT: /data
+      DEFAULT_KNOWLEDGE_BASE_ID: ${DEFAULT_KNOWLEDGE_BASE_ID:-}
+      DAILY_REQUEST_QUOTA: ${DAILY_REQUEST_QUOTA:-100}
+      AUTH_ENABLED: ${AGENT_AUTH_ENABLED:-false}
+      API_KEYS_JSON: ${AGENT_API_KEYS_JSON:-{}}
     volumes:
       - agent-runtime:/data
     depends_on:
@@ -57,7 +95,7 @@ services:
       REDIS_URL: redis://redis:6379/0
       KNOWLEDGE_API_URL: http://knowledge-api:8001
       AGENT_API_URL: http://agent-api:8002
-      ALLOWED_ORIGINS: http://localhost:8080
+      ALLOWED_ORIGINS: '["http://localhost:8080"]'
     depends_on:
       evaluation-db:
         condition: service_healthy
@@ -111,6 +149,16 @@ services:
     image: qdrant/qdrant:v1.12.5
     volumes: ["qdrant-data:/qdrant/storage"]
 
+  prometheus:
+    image: prom/prometheus:v3.1.0
+    profiles: ["observability"]
+    command: ["--config.file=/etc/prometheus/prometheus.yml"]
+    volumes:
+      - ./prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - prometheus-data:/prometheus
+    ports: ["9090:9090"]
+    depends_on: [knowledge-api, agent-api, evaluation-api]
+
 volumes:
   knowledge-db:
   agent-db:
@@ -119,4 +167,5 @@ volumes:
   qdrant-data:
   knowledge-files:
   agent-runtime:
+  prometheus-data:
 

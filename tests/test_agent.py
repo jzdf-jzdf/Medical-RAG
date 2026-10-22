@@ -1,6 +1,6 @@
 from app.api.chat import _exception_detail
 from app.services.agent import MedicalAgent, _parse_json_object
-from app.services.mcp_client import MCPToolbox, ToolDefinition, ToolOutput
+from app.services.mcp_client import MCPToolbox, ToolDefinition, ToolOutput, _mcp_http_timeout
 
 
 class FakeModel:
@@ -162,3 +162,12 @@ async def test_mcp_cleanup_failure_does_not_escape_toolbox_exit() -> None:
     toolbox._stack = _FailingExitStack()
 
     await toolbox.__aexit__(None, None, None)
+
+
+def test_mcp_http_timeout_uses_configured_value() -> None:
+    timeout = _mcp_http_timeout(30)
+
+    assert timeout.connect == 30
+    assert timeout.read == 30
+    assert timeout.write == 30
+    assert timeout.pool == 30

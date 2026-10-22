@@ -102,8 +102,13 @@ class MCPToolbox:
                     )
                 )
             else:
+                # httpx2 defaults to a 5 second read timeout. Tool calls load
+                # MedCPT models and search Qdrant, which regularly exceed that;
+                # an HTTP-level timeout also surfaces later as an anyio
+                # TaskGroup ExceptionGroup while the transport is closing.
+                timeout = _mcp_http_timeout(config.timeout_seconds)
                 http_client = await server_stack.enter_async_context(
-                    httpx2.AsyncClient(trust_env=False)
+                    httpx2.AsyncClient(trust_env=False, timeout=timeout)
                 )
                 streams = await server_stack.enter_async_context(
                     streamable_http_client(str(config.url), http_client=http_client)
@@ -175,3 +180,14 @@ class MCPToolbox:
 def _http_client(**kwargs: Any) -> httpx2.AsyncClient:
     """Build MCP HTTP clients without inheriting malformed host proxy settings."""
     return httpx2.AsyncClient(trust_env=False, **kwargs)
+
+
+def _mcp_http_timeout(seconds: float) -> httpx2.Timeout:
+    """Use the configured MCP timeout instead of httpx2's 5 second default."""
+
+    return httpx2.Timeout(
+        connect=seconds,
+        read=seconds,
+        write=seconds,
+        pool=seconds,
+    )

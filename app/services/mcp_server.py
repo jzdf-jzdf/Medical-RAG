@@ -95,7 +95,13 @@ mcp_http_app = mcp_server.streamable_http_app(
     streamable_http_path="/",
     json_response=True,
     transport_security=TransportSecuritySettings(
-        allowed_hosts=["127.0.0.1:*", "localhost:*", "knowledge-api:8001"],
+        allowed_hosts=[
+            "127.0.0.1:*",
+            "localhost:*",
+            "127.0.0.1",
+            "localhost",
+            "knowledge-api:8001",
+        ],
         allowed_origins=["http://127.0.0.1:*", "http://localhost:*"],
     ),
 )

@@ -31,6 +31,7 @@ uvicorn app.main:app --reload --port 8001
 ## MCP
 
 - Streamable HTTP MCP 地址为 `/mcp/`，提供 `list_knowledge_bases`、`search_medical_knowledge`、`get_knowledge_chunk` 三个只读工具。
+- 集成部署时网关同时暴露 `http://localhost:8080/mcp/`，并保留原始 Host 以通过 MCP 的 DNS rebinding 校验。
 - 可通过 `AUTH_ENABLED=true` 与 `API_KEYS_JSON` 启用 API Key 权限；读取需要 viewer，写入需要 editor。
 
 ## MinerU

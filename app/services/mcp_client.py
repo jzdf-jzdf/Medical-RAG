@@ -71,7 +71,13 @@ class MCPToolbox:
         return self
 
     async def __aexit__(self, exc_type, exc, traceback) -> None:
-        await self._stack.__aexit__(exc_type, exc, traceback)
+        # MCP transports run background task groups. A transport failure during
+        # teardown must not turn an already completed answer into a 502, and it
+        # must not replace the original exception that is already propagating.
+        try:
+            await self._stack.__aexit__(exc_type, exc, traceback)
+        except Exception:
+            logger.warning("MCP toolbox cleanup failed", exc_info=True)
 
     async def _connect(self, config: MCPServerSettings) -> None:
         server_stack = AsyncExitStack()
@@ -114,7 +120,10 @@ class MCPToolbox:
             await session.initialize()
             await self._discover(config, session)
         except Exception:
-            await server_stack.aclose()
+            try:
+                await server_stack.aclose()
+            except Exception:
+                logger.warning("MCP connection cleanup failed", exc_info=True)
             raise
         self._stack.push_async_callback(server_stack.aclose)
         self._connections.append(_Connection(config=config, session=session))

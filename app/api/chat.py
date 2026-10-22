@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import logging
 import uuid
 from datetime import UTC, datetime
 
@@ -21,6 +22,24 @@ from app.services.harness import HarnessService
 from app.services.mcp_client import MCPToolbox
 
 router = APIRouter(tags=["chat"])
+logger = logging.getLogger(__name__)
+
+
+def _exception_detail(exc: BaseException, *, limit: int = 800) -> str:
+    """Flatten nested ExceptionGroups so the useful leaf cause is not hidden."""
+
+    messages: list[str] = []
+
+    def walk(error: BaseException) -> None:
+        if isinstance(error, BaseExceptionGroup):
+            for child in error.exceptions:
+                walk(child)
+            return
+        text = str(error).strip()
+        messages.append(f"{type(error).__name__}: {text}" if text else type(error).__name__)
+
+    walk(exc)
+    return "; ".join(dict.fromkeys(messages))[:limit] or repr(exc)
 
 
 @router.post("/chat", response_model=ChatResponse)
@@ -106,10 +125,13 @@ async def chat(
                 },
             )
     except Exception as exc:
+        logger.exception("Agent execution failed for conversation %s", conversation_id)
         run.status = "failed"
         run.finished_at = datetime.now(UTC)
         await db.commit()
-        raise HTTPException(status_code=502, detail=f"Agent execution failed: {exc}") from exc
+        raise HTTPException(
+            status_code=502, detail=f"Agent execution failed: {_exception_detail(exc)}"
+        ) from exc
 
     assistant_message = Message(
         conversation_id=conversation_id,

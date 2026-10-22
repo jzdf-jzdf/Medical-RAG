@@ -1,5 +1,6 @@
+from app.api.chat import _exception_detail
 from app.services.agent import MedicalAgent, _parse_json_object
-from app.services.mcp_client import ToolDefinition, ToolOutput
+from app.services.mcp_client import MCPToolbox, ToolDefinition, ToolOutput
 
 
 class FakeModel:
@@ -133,3 +134,31 @@ def test_parse_json_from_markdown_fence() -> None:
         "action": "final",
         "answer": "ok",
     }
+
+
+def test_exception_detail_unwraps_nested_task_group_error() -> None:
+    error = ExceptionGroup(
+        "unhandled errors in a TaskGroup",
+        [ConnectionResetError("peer reset")],
+    )
+
+    detail = _exception_detail(error)
+
+    assert "ConnectionResetError" in detail
+    assert "peer reset" in detail
+    assert "unhandled errors" not in detail
+
+
+class _FailingExitStack:
+    async def __aexit__(self, *_args) -> None:
+        raise ExceptionGroup(
+            "unhandled errors in a TaskGroup",
+            [RuntimeError("transport closed")],
+        )
+
+
+async def test_mcp_cleanup_failure_does_not_escape_toolbox_exit() -> None:
+    toolbox = MCPToolbox([])
+    toolbox._stack = _FailingExitStack()
+
+    await toolbox.__aexit__(None, None, None)

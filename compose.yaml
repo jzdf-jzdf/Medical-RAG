@@ -76,6 +76,7 @@ services:
       MODEL_API_KEY: ${MODEL_API_KEY:-}
       MODEL_ENCRYPTION_KEY: ${MODEL_ENCRYPTION_KEY:-}
       MCP_SERVERS_JSON: ${MCP_SERVERS_JSON:-[]}
+      MAX_TOOL_ROUNDS: ${MAX_TOOL_ROUNDS:-8}
       WORKSPACE_ROOT: /data
       DEFAULT_KNOWLEDGE_BASE_ID: ${DEFAULT_KNOWLEDGE_BASE_ID:-}
       DAILY_REQUEST_QUOTA: ${DAILY_REQUEST_QUOTA:-100}
@@ -96,6 +97,7 @@ services:
       KNOWLEDGE_API_URL: http://knowledge-api:8001
       AGENT_API_URL: http://agent-api:8002
       ALLOWED_ORIGINS: '["http://localhost:8080"]'
+      REQUEST_TIMEOUT_SECONDS: ${EVALUATION_REQUEST_TIMEOUT_SECONDS:-300}
     depends_on:
       evaluation-db:
         condition: service_healthy

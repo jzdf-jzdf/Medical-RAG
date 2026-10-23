@@ -1,8 +1,8 @@
-export interface DocumentSummary {
-  id: string
-  title: string
-}
+export type QuestionType = 'qa' | 'single_choice'
+export type QuestionStyle = 'patient' | 'clinician' | 'professional' | 'public'
+export type QuestionSource = 'manual' | 'generated'
 
+export interface DocumentSummary { id: string; title: string }
 export interface KnowledgeBaseSummary {
   id: string
   name: string
@@ -10,7 +10,6 @@ export interface KnowledgeBaseSummary {
   status: string
   documents: DocumentSummary[]
 }
-
 export interface ChunkItem {
   index: number
   content: string
@@ -20,7 +19,6 @@ export interface ChunkItem {
   char_count: number
   heading_path: string[]
 }
-
 export interface ChunkStats {
   total: number
   average_chars: number
@@ -29,7 +27,6 @@ export interface ChunkStats {
   too_short: number
   too_long: number
 }
-
 export interface DocumentChunks {
   document_id: string
   document_title: string
@@ -38,16 +35,14 @@ export interface DocumentChunks {
   chunks: ChunkItem[]
   stats: ChunkStats
 }
-
-export interface EvidenceExcerpt {
-  chunk_index: number
-  heading: string
-  quote: string
-}
-
+export interface ChoiceOption { key: string; text: string }
+export interface EvidenceExcerpt { chunk_index: number; heading: string; quote: string }
 export interface GeneratedQuestion {
+  question_type: QuestionType
   question: string
   standard_answer: string
+  options: ChoiceOption[]
+  correct_answer?: string | null
   difficulty: string
   topic: string
   rationale: string
@@ -57,14 +52,45 @@ export interface GeneratedQuestion {
   model: string
   provider: string
 }
-
-export interface AgentTestResult {
-  answer: string
-  expected_answer?: string | null
-  run_id: string
-  model: string
-  provider: string
-  degraded_without_evidence: boolean
-  citations: Record<string, unknown>[]
-  tool_calls: Record<string, unknown>[]
+export interface GeneratedQuestionBatch {
+  questions: GeneratedQuestion[]
+  requested_count: number
+  question_type: QuestionType
+  question_style: QuestionStyle
+}
+export interface QuestionBankSummary {
+  id: string
+  name: string
+  description?: string | null
+  version: string
+  question_count: number
+  qa_count: number
+  choice_count: number
+  created_at: string
+  updated_at: string
+}
+export interface StoredQuestion {
+  id: string
+  bank_id: string
+  bank_name: string
+  question_type: QuestionType
+  prompt: string
+  standard_answer: string
+  options: ChoiceOption[]
+  correct_answer?: string | null
+  source: QuestionSource
+  evidence: Record<string, unknown>[]
+  metadata: Record<string, unknown>
+  created_at: string
+}
+export interface QuestionBankDetail extends QuestionBankSummary { questions: StoredQuestion[] }
+export interface QuestionInput {
+  question_type: QuestionType
+  prompt: string
+  standard_answer: string
+  options?: ChoiceOption[]
+  correct_answer?: string | null
+  source?: QuestionSource
+  evidence?: Record<string, unknown>[]
+  metadata?: Record<string, unknown>
 }

@@ -13,6 +13,7 @@ export interface StoredMessage {
   role: 'user' | 'assistant'
   content: string
   created_at: string
+  result?: ChatResult | null
 }
 
 export interface ConversationDetail extends ConversationSummary {
@@ -30,15 +31,50 @@ export interface ToolCall {
   is_error: boolean
 }
 
+export interface Citation {
+  document_id?: string
+  chunk_id?: string
+  index_version?: string
+  title?: string
+  heading?: string
+  page_start?: number | null
+  page_end?: number | null
+  text?: string
+  score?: number | null
+  rank?: number | null
+}
+
+export interface Verification {
+  passed: boolean
+  mode: string
+  issues: string[]
+  claim_count?: number
+  supported_claims?: number
+  citation_count: number
+  semantic_passed?: boolean
+  claims?: SemanticClaim[]
+}
+
+export interface SemanticClaim {
+  claim_id: number
+  text: string
+  citation_ids: number[]
+  supported: boolean
+  evidence: Array<{ citation_id: number; quote: string }>
+  reason?: string
+}
+
 export interface ChatResult {
   run_id: string
   message_id: string
   content: string
-  citations: Array<Record<string, unknown>>
+  citations: Citation[]
   degraded_without_evidence: boolean
   model: string
   provider: string
   tool_calls: ToolCall[]
+  verification: Verification
+  trace: Array<Record<string, unknown>>
 }
 
 export interface ModelConfig {

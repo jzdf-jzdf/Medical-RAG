@@ -13,9 +13,11 @@ import {
   sendChat,
   updateModel,
   type ChatResult,
+  type Citation,
   type ConversationSummary,
   type ModelConfig,
   type ModelConfigInput,
+  type SemanticClaim,
   type ToolCall,
 } from './api'
 
@@ -29,6 +31,15 @@ interface ChatMessage {
 
 interface ModelForm extends ModelConfigInput {
   api_key: string
+}
+
+interface RetrievedChunk extends Citation {
+  callIndex: number
+}
+
+interface TextSegment {
+  text: string
+  highlighted: boolean
 }
 
 const userId = getUserId()
@@ -59,6 +70,37 @@ const activeConversation = computed(() =>
 )
 const toolCalls = computed<ToolCall[]>(() => selectedResult.value?.tool_calls ?? [])
 const evidenceCount = computed(() => selectedResult.value?.citations.length ?? 0)
+const citedChunks = computed<Citation[]>(() => selectedResult.value?.citations ?? [])
+const citedChunkIds = computed(
+  () => new Set(citedChunks.value.map((item) => item.chunk_id).filter(Boolean)),
+)
+const retrievedChunks = computed<RetrievedChunk[]>(() => {
+  const chunks: RetrievedChunk[] = []
+  toolCalls.value.forEach((call, callIndex) => {
+    if (!['search_medical_knowledge', 'hybrid_search'].includes(call.tool)) return
+    const payload = unwrapToolResult(call.result)
+    const items = payload && Array.isArray(payload.items) ? payload.items : []
+    items.forEach((value) => {
+      if (!isRecord(value)) return
+      chunks.push({
+        callIndex: callIndex + 1,
+        document_id: stringValue(value.document_id),
+        chunk_id: stringValue(value.chunk_id),
+        index_version: stringValue(value.index_version),
+        title: stringValue(value.document_title) || stringValue(value.title),
+        heading: Array.isArray(value.heading_path)
+          ? value.heading_path.map(String).join(' › ')
+          : stringValue(value.heading),
+        page_start: numberValue(value.page_start),
+        page_end: numberValue(value.page_end),
+        text: stringValue(value.content) || stringValue(value.text),
+        score: numberValue(value.score),
+        rank: numberValue(value.rank),
+      })
+    })
+  })
+  return chunks
+})
 const activeModel = computed(() =>
   models.value.find((item) => item.id === selectedModelId.value),
 )
@@ -112,8 +154,11 @@ async function selectConversation(id: string) {
       role: item.role,
       content: item.content,
       createdAt: item.created_at,
+      result: item.result ?? undefined,
     }))
-    selectedResult.value = null
+    selectedResult.value = [...messages.value]
+      .reverse()
+      .find((item) => item.result)?.result ?? null
     inspectorOpen.value = false
     sidebarOpen.value = false
     await scrollToBottom()
@@ -296,8 +341,109 @@ function formatTime(value: string) {
   }).format(new Date(value))
 }
 
-function formatArguments(value: Record<string, unknown>) {
-  return JSON.stringify(value, null, 2)
+function formatValue(value: unknown) {
+  return JSON.stringify(value, null, 2) ?? String(value)
+}
+
+function displayedMessageContent(content: string) {
+  return content
+    .split('\n')
+    .filter((line) => !line.includes('引用核验未通过'))
+    .join('\n')
+    .trim()
+}
+
+function hasVerificationFailure(result: ChatResult) {
+  return result.citations.length > 0 && result.verification?.passed === false
+}
+
+function verificationIssueText(result: ChatResult) {
+  const labels: Record<string, string> = {
+    missing_sources: '未获得有效来源',
+    numeric_mismatch: '数字与引用证据不一致',
+    uncited_claim: '存在未标注来源的陈述',
+    invalid_source: '引用编号无效',
+    semantic_mismatch: '陈述与引用原文不完全对应',
+    semantic_verification_failed: '语义核验未完成',
+  }
+  return (result.verification?.issues ?? []).map((item) => labels[item] || item).join('·')
+}
+
+function semanticClaims(result: ChatResult) {
+  return result.verification?.claims ?? []
+}
+
+function claimsForCitation(citationId: number): SemanticClaim[] {
+  if (!selectedResult.value) return []
+  return semanticClaims(selectedResult.value).filter((claim) =>
+    claim.citation_ids.includes(citationId),
+  )
+}
+
+function highlightedSegments(text: string, citationId: number): TextSegment[] {
+  if (!selectedResult.value || !text) return [{ text, highlighted: false }]
+  const quotes = semanticClaims(selectedResult.value)
+    .flatMap((claim) => claim.evidence)
+    .filter((item) => item.citation_id === citationId && item.quote)
+    .map((item) => item.quote)
+  const ranges: Array<[number, number]> = []
+  quotes.forEach((quote) => {
+    let offset = 0
+    while (offset < text.length) {
+      const start = text.indexOf(quote, offset)
+      if (start < 0) break
+      ranges.push([start, start + quote.length])
+      offset = start + quote.length
+    }
+  })
+  if (!ranges.length) return [{ text, highlighted: false }]
+  ranges.sort((left, right) => left[0] - right[0])
+  const merged: Array<[number, number]> = []
+  ranges.forEach(([start, end]) => {
+    const previous = merged[merged.length - 1]
+    if (previous && start <= previous[1]) previous[1] = Math.max(previous[1], end)
+    else merged.push([start, end])
+  })
+  const segments: TextSegment[] = []
+  let cursor = 0
+  merged.forEach(([start, end]) => {
+    if (start > cursor) segments.push({ text: text.slice(cursor, start), highlighted: false })
+    segments.push({ text: text.slice(start, end), highlighted: true })
+    cursor = end
+  })
+  if (cursor < text.length) segments.push({ text: text.slice(cursor), highlighted: false })
+  return segments
+}
+
+function runStatus(result: ChatResult) {
+  if (hasVerificationFailure(result)) return '引用核验未通过'
+  if (result.degraded_without_evidence) return '证据不足'
+  return '已完成'
+}
+
+function unwrapToolResult(value: unknown): Record<string, unknown> | null {
+  if (!isRecord(value)) return null
+  if (isRecord(value.content) && Array.isArray(value.content.items)) return value.content
+  return value
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === 'object' && value !== null && !Array.isArray(value)
+}
+
+function stringValue(value: unknown) {
+  return typeof value === 'string' ? value : ''
+}
+
+function numberValue(value: unknown) {
+  return typeof value === 'number' ? value : null
+}
+
+function pageLabel(item: Citation) {
+  if (item.page_start == null && item.page_end == null) return '页码未标注'
+  return item.page_start === item.page_end || item.page_end == null
+    ? `P.${item.page_start}`
+    : `P.${item.page_start}–${item.page_end}`
 }
 
 function makeTitle(content: string) {
@@ -355,14 +501,14 @@ async function scrollToBottom() {
     />
 
     <aside class="sidebar" :class="{ open: sidebarOpen }">
-      <div class="brand">
+      <a class="brand" href="/knowledge/" aria-label="返回知识空间">
         <span class="brand-mark" aria-hidden="true">
           <svg class="brand-glyph" viewBox="0 0 26 12" focusable="false">
             <path d="M0 0h2v12H0zM12 0H6C4.9 0 4 .9 4 2v8c0 1.1.9 2 2 2h6v-2H6V2h6zM15 0h2v5h7V0h2v12h-2V7h-7v5h-2z" />
           </svg>
         </span>
-        <div><strong>循证医学平台</strong><small>ICH EVIDENCE OS</small></div>
-      </div>
+        <span class="brand-copy"><strong>循证医学平台</strong><small>ICH EVIDENCE OS</small></span>
+      </a>
 
       <div class="platform-switcher" role="navigation" aria-label="平台应用切换">
         <a href="/knowledge/">知识空间</a>
@@ -458,11 +604,16 @@ async function scrollToBottom() {
               <span>{{ message.role === 'user' ? '你的问题' : '循证回答' }}</span>
               <time>{{ formatTime(message.createdAt) }}</time>
             </div>
-            <p>{{ message.content }}</p>
+            <p>{{ displayedMessageContent(message.content) }}</p>
             <div v-if="message.result" class="answer-meta">
-              <span v-if="message.result.degraded_without_evidence" class="warning-chip">证据不足</span>
-              <span v-else-if="message.result.citations.length" class="verified-chip">引用已核验</span>
-              <span v-else class="neutral-chip">无需检索</span>
+              <div class="answer-status">
+                <span v-if="hasVerificationFailure(message.result)" class="warning-chip">引用核验未通过</span>
+                <span v-else-if="message.result.degraded_without_evidence" class="warning-chip">证据不足</span>
+                <span v-else-if="message.result.verification.semantic_passed" class="verified-chip">语义核验通过</span>
+                <span v-else-if="message.result.citations.length" class="verified-chip">引用已核验</span>
+                <span v-else class="neutral-chip">无需检索</span>
+                <small v-if="hasVerificationFailure(message.result)">{{ verificationIssueText(message.result) }}</small>
+              </div>
               <span>{{ message.result.model }}</span>
               <button type="button" @click="openInspector(message.result)">
                 {{ message.result.tool_calls.length }} 次工具调用
@@ -510,9 +661,11 @@ async function scrollToBottom() {
 
       <template v-if="selectedResult">
         <dl class="run-summary">
-          <div><dt>状态</dt><dd :class="selectedResult.degraded_without_evidence ? 'warn' : 'success'">{{ selectedResult.degraded_without_evidence ? '证据不足' : '已完成' }}</dd></div>
+          <div><dt>状态</dt><dd :class="selectedResult.degraded_without_evidence ? 'warn' : 'success'">{{ runStatus(selectedResult) }}</dd></div>
           <div><dt>模型</dt><dd>{{ selectedResult.model }}</dd></div>
+          <div><dt>检索返回</dt><dd>{{ retrievedChunks.length }}</dd></div>
           <div><dt>证据引用</dt><dd>{{ evidenceCount }}</dd></div>
+          <div><dt>陈述支持</dt><dd>{{ selectedResult.verification.supported_claims ?? '—' }}/{{ semanticClaims(selectedResult).length || '—' }}</dd></div>
           <div><dt>工具调用</dt><dd>{{ toolCalls.length }}</dd></div>
         </dl>
 
@@ -525,7 +678,63 @@ async function scrollToBottom() {
               <span><strong>{{ call.tool }}</strong><small>{{ call.server }} · {{ call.latency_ms }} ms</small></span>
               <svg viewBox="0 0 24 24" aria-hidden="true"><path d="m7 10 5 5 5-5" /></svg>
             </summary>
-            <pre>{{ formatArguments(call.arguments) }}</pre>
+            <div class="tool-payload">
+              <span>调用参数</span>
+              <pre>{{ formatValue(call.arguments) }}</pre>
+              <span>原始返回</span>
+              <pre>{{ formatValue(call.result) }}</pre>
+            </div>
+          </details>
+        </div>
+
+        <div class="inspector-section">
+          <div class="section-title"><span>全部返回知识块</span><b>{{ retrievedChunks.length }}</b></div>
+          <p v-if="!retrievedChunks.length" class="inspector-empty">本轮没有检索到知识块。</p>
+          <details
+            v-for="(chunk, index) in retrievedChunks"
+            :key="`${chunk.callIndex}-${chunk.chunk_id || index}`"
+            class="evidence-item"
+          >
+            <summary>
+              <b>{{ chunk.rank || index + 1 }}</b>
+              <span><strong>{{ chunk.title || '未命名来源' }}</strong><small>{{ chunk.heading || pageLabel(chunk) }}</small></span>
+              <em v-if="chunk.chunk_id && citedChunkIds.has(chunk.chunk_id)">已引用</em>
+              <em v-else>调用 {{ chunk.callIndex }}</em>
+            </summary>
+            <div class="evidence-body">
+              <p>{{ chunk.text }}</p>
+              <small>{{ pageLabel(chunk) }} · score {{ chunk.score ?? '—' }}</small>
+              <code>{{ chunk.chunk_id || '无 chunk_id' }}</code>
+            </div>
+          </details>
+        </div>
+
+        <div class="inspector-section">
+          <div class="section-title"><span>当前回复引用</span><b>{{ citedChunks.length }}</b></div>
+          <p v-if="!citedChunks.length" class="inspector-empty">当前回复没有使用知识块引用。</p>
+          <details v-for="(chunk, index) in citedChunks" :key="chunk.chunk_id || index" class="evidence-item cited">
+            <summary>
+              <b>[{{ index + 1 }}]</b>
+              <span><strong>{{ chunk.title || '未命名来源' }}</strong><small>{{ chunk.heading || pageLabel(chunk) }}</small></span>
+              <em>引用</em>
+            </summary>
+            <div class="evidence-body">
+              <div v-if="claimsForCitation(index + 1).length" class="claim-links">
+                <span>对应陈述</span>
+                <div v-for="claim in claimsForCitation(index + 1)" :key="claim.claim_id">
+                  <b :class="{ failed: !claim.supported }">{{ claim.supported ? '已支持' : '未通过' }}</b>
+                  <p>{{ claim.text }}</p>
+                  <small v-if="!claim.supported && claim.reason">{{ claim.reason }}</small>
+                </div>
+              </div>
+              <p class="source-text">
+                <template v-for="(segment, segmentIndex) in highlightedSegments(chunk.text || '', index + 1)" :key="segmentIndex">
+                  <mark v-if="segment.highlighted">{{ segment.text }}</mark><template v-else>{{ segment.text }}</template>
+                </template>
+              </p>
+              <small>{{ pageLabel(chunk) }} · score {{ chunk.score ?? '—' }}</small>
+              <code>{{ chunk.chunk_id || '无 chunk_id' }}</code>
+            </div>
           </details>
         </div>
 

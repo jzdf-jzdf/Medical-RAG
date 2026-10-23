@@ -1,8 +1,10 @@
-"""Contracts for the chunk-to-question Agent testing workbench."""
+"""Contracts for evidence-driven question generation."""
 
-from typing import Any
+from typing import Literal
 
-from pydantic import BaseModel, Field, field_validator
+from pydantic import BaseModel, Field, field_validator, model_validator
+
+from app.schemas.question_bank import ChoiceOption, QuestionType
 
 
 class DocumentSummary(BaseModel):
@@ -50,6 +52,9 @@ class GenerateQuestionRequest(BaseModel):
     collection_id: str = Field(min_length=1)
     document_id: str = Field(min_length=1)
     chunk_indexes: list[int] = Field(min_length=1, max_length=8)
+    question_count: int = Field(default=1, ge=1, le=5)
+    question_type: QuestionType = "qa"
+    question_style: Literal["patient", "clinician", "professional", "public"] = "clinician"
     instructions: str | None = Field(default=None, max_length=1000)
     model_config_id: str | None = None
 
@@ -70,8 +75,11 @@ class EvidenceExcerpt(BaseModel):
 
 
 class GeneratedQuestion(BaseModel):
+    question_type: QuestionType
     question: str = Field(min_length=1)
     standard_answer: str = Field(min_length=1)
+    options: list[ChoiceOption] = Field(default_factory=list, max_length=6)
+    correct_answer: str | None = Field(default=None, max_length=8)
     difficulty: str = "中等"
     topic: str = ""
     rationale: str = ""
@@ -81,22 +89,28 @@ class GeneratedQuestion(BaseModel):
     model: str
     provider: str
 
+    @model_validator(mode="after")
+    def validate_generated_shape(self) -> "GeneratedQuestion":
+        if self.question_type == "qa":
+            self.options = []
+            self.correct_answer = None
+            return self
+        if len(self.options) < 2:
+            raise ValueError("选择题至少需要 2 个选项")
+        keys = [item.key.strip().upper() for item in self.options]
+        answer = (self.correct_answer or "").strip().upper()
+        if len(set(keys)) != len(keys) or answer not in keys:
+            raise ValueError("选择题选项或正确答案无效")
+        self.options = [
+            ChoiceOption(key=key, text=option.text)
+            for key, option in zip(keys, self.options)
+        ]
+        self.correct_answer = answer
+        return self
 
-class AgentTestRequest(BaseModel):
-    question: str = Field(min_length=1, max_length=8000)
-    expected_answer: str | None = Field(default=None, max_length=16000)
-    model_config_id: str | None = None
 
-
-class AgentTestResult(BaseModel):
-    answer: str
-    expected_answer: str | None = None
-    run_id: str
-    model: str
-    provider: str
-    degraded_without_evidence: bool
-    citations: list[dict[str, Any]] = Field(default_factory=list)
-    tool_calls: list[dict[str, Any]] = Field(default_factory=list)
-    verification: dict[str, Any] = Field(default_factory=dict)
-    trace: list[dict[str, Any]] = Field(default_factory=list)
-    links: dict[str, str] = Field(default_factory=dict)
+class GeneratedQuestionBatch(BaseModel):
+    questions: list[GeneratedQuestion] = Field(min_length=1, max_length=5)
+    requested_count: int = Field(ge=1, le=5)
+    question_type: QuestionType
+    question_style: Literal["patient", "clinician", "professional", "public"]

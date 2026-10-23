@@ -15,6 +15,9 @@ class Dataset(Base):
     version: Mapped[str] = mapped_column(String(128))
     description: Mapped[str | None] = mapped_column(Text)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), onupdate=func.now()
+    )
 
 
 class Question(Base):
@@ -27,6 +30,11 @@ class Question(Base):
     gold_answer: Mapped[str] = mapped_column(Text)
     gold_evidence: Mapped[list] = mapped_column(JSONB, default=list)
     metadata_json: Mapped[dict] = mapped_column("metadata", JSONB, default=dict)
+    question_type: Mapped[str] = mapped_column(String(32), default="qa", index=True)
+    options: Mapped[list] = mapped_column(JSONB, default=list)
+    correct_answer: Mapped[str | None] = mapped_column(String(32))
+    source: Mapped[str] = mapped_column(String(32), default="manual", index=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
 
 
 class EvaluationRun(Base):

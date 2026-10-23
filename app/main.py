@@ -5,6 +5,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from sqlalchemy import text
 
 from app.api.evaluation import router as evaluation_router
+from app.api.question_banks import router as question_banks_router
 from app.api.workbench import router as workbench_router
 from app.core.config import get_settings
 from app.db import engine
@@ -30,6 +31,7 @@ app.add_middleware(
 app.middleware("http")(instrument("medical-evaluation-api"))
 app.mount("/metrics", metrics_app())
 app.include_router(workbench_router, prefix="/api/v1")
+app.include_router(question_banks_router, prefix="/api/v1")
 app.include_router(evaluation_router, prefix="/api/v1")
 
 

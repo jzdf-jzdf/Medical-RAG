@@ -1,10 +1,13 @@
 from fastapi.testclient import TestClient
 
 from app.main import app
-from app.services.platform_client import get_platform_client
+from app.services.platform_client import PlatformClient, get_platform_client
 
 
 class FakePlatformClient:
+    def __init__(self):
+        self.generation_calls = 0
+
     async def list_knowledge_bases(self):
         return [
             {
@@ -44,13 +47,31 @@ class FakePlatformClient:
             },
         }
 
-    async def ask_agent(self, *, content: str, title: str, model_config_id=None):
+    async def ask_agent(
+        self,
+        *,
+        content: str,
+        title: str,
+        model_config_id=None,
+        execution_mode="agent",
+    ):
         if title.startswith("出题"):
+            self.generation_calls += 1
             assert "分块 0" in content
+            assert "生成一道" in content
+            assert f"第 {self.generation_calls}/2 道" in content
+            assert "患者或家属口吻" in content
+            assert execution_mode == "direct"
+            question = (
+                "我突然出现脑出血相关症状，应尽快做什么检查？"
+                if self.generation_calls == 1
+                else "我担心是急性脑出血，医院会优先安排哪项影像检查？"
+            )
             return {
-                "run_id": "run-generation",
+                "run_id": f"run-generation-{self.generation_calls}",
                 "content": (
-                    '{"question":"急性脑出血首选何种影像检查？",'
+                    '{'
+                    f'"question":"{question}",'
                     '"standard_answer":"应尽快完成头颅 CT 检查。",'
                     '"difficulty":"基础","topic":"影像诊断",'
                     '"rationale":"考查首选检查",'
@@ -60,6 +81,7 @@ class FakePlatformClient:
                 "model": "test-model",
                 "provider": "test-provider",
             }
+        assert execution_mode == "agent"
         return {
             "run_id": "run-test",
             "content": "应尽快完成头颅 CT 检查。",
@@ -89,14 +111,13 @@ def test_workbench_happy_path() -> None:
                     "collection_id": "kb-1",
                     "document_id": "doc-1",
                     "chunk_indexes": [0],
+                    "question_count": 2,
+                    "question_style": "patient",
                 },
             )
-            agent_test = client.post(
+            removed_agent_test = client.post(
                 "/api/v1/agent-tests",
-                json={
-                    "question": "急性脑出血首选何种影像检查？",
-                    "expected_answer": "应尽快完成头颅 CT 检查。",
-                },
+                json={"question": "急性脑出血首选何种影像检查？"},
             )
     finally:
         app.dependency_overrides.clear()
@@ -106,11 +127,13 @@ def test_workbench_happy_path() -> None:
     assert chunks.status_code == 200
     assert chunks.json()["chunks"][0]["heading_path"] == ["诊断", "影像检查"]
     assert question.status_code == 200
-    assert question.json()["evidence"][0]["chunk_index"] == 0
-    assert question.json()["source_chunks"][0]["index"] == 0
-    assert agent_test.status_code == 200
-    assert agent_test.json()["run_id"] == "run-test"
-    assert agent_test.json()["degraded_without_evidence"] is False
+    assert question.json()["requested_count"] == 2
+    assert question.json()["question_type"] == "qa"
+    assert question.json()["question_style"] == "patient"
+    assert len(question.json()["questions"]) == 2
+    assert question.json()["questions"][0]["evidence"][0]["chunk_index"] == 0
+    assert question.json()["questions"][0]["source_chunks"][0]["index"] == 0
+    assert removed_agent_test.status_code == 404
 
 
 def test_generate_rejects_unknown_chunk() -> None:
@@ -130,3 +153,27 @@ def test_generate_rejects_unknown_chunk() -> None:
 
     assert response.status_code == 422
     assert "99" in response.json()["detail"]
+
+
+async def test_direct_generation_retries_one_empty_agent_response() -> None:
+    client = object.__new__(PlatformClient)
+    client.agent_url = "http://agent"
+    client.user_id = "evaluation-workbench"
+    chat_attempts = 0
+
+    async def fake_request(method: str, url: str, **kwargs):
+        nonlocal chat_attempts
+        if url.endswith("/conversations"):
+            return {"id": "conversation-1"}
+        chat_attempts += 1
+        return {"content": "" if chat_attempts == 1 else '{"questions": []}'}
+
+    client._request = fake_request
+    result = await client.ask_agent(
+        content="prompt",
+        title="出题",
+        execution_mode="direct",
+    )
+
+    assert chat_attempts == 2
+    assert result["content"] == '{"questions": []}'

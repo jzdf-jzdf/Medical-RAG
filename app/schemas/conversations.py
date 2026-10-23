@@ -3,6 +3,8 @@ from datetime import datetime
 
 from pydantic import BaseModel, ConfigDict, Field
 
+from app.schemas.evidence import ChatResponse
+
 
 class ConversationCreate(BaseModel):
     title: str = Field(default="新会话", min_length=1, max_length=500)
@@ -15,6 +17,7 @@ class MessageRead(BaseModel):
     role: str
     content: str
     created_at: datetime
+    result: ChatResponse | None = None
 
 
 class ConversationRead(BaseModel):

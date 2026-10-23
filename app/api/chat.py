@@ -15,7 +15,7 @@ from app.core.security import enforce_user
 from app.db.session import get_db
 from app.models import AgentRun, AnswerCitation, Conversation, Message, ModelConfig, ToolCall
 from app.schemas.evidence import ChatRequest, ChatResponse
-from app.services.agent import MedicalAgent
+from app.services.agent import AgentResult, MedicalAgent
 from app.services.crypto import decrypt_secret
 from app.services.governance import consume_quota, record_audit
 from app.services.harness import HarnessService
@@ -100,8 +100,8 @@ async def chat(
         user_message_id=user_message.id,
         model_provider=provider,
         model_name=model,
-        prompt_version="medical-v1",
-        skill_version="basic-tool-loop-v1",
+        prompt_version="medical-v2",
+        skill_version="global-citations-semantic-v1",
         status="running",
     )
     db.add(run)
@@ -109,21 +109,30 @@ async def chat(
     await db.refresh(run)
 
     collection_id = payload.collection_id or settings.default_knowledge_base_id
-    agent = MedicalAgent(harness, settings.max_tool_rounds)
     try:
-        async with MCPToolbox(settings.mcp_servers_json) as toolbox:
-            result = await agent.run(
-                question=payload.content,
+        if payload.execution_mode == "direct":
+            answer = await harness.generate(
+                payload.content,
                 conversation_id=str(conversation_id),
-                history=history,
-                toolbox=toolbox,
                 model=model,
                 provider=provider,
-                tool_context={
-                    "collection_id": collection_id,
-                    "top_k": payload.retrieval_top_k,
-                },
             )
+            result = AgentResult(answer=answer)
+        else:
+            agent = MedicalAgent(harness, settings.max_tool_rounds)
+            async with MCPToolbox(settings.mcp_servers_json) as toolbox:
+                result = await agent.run(
+                    question=payload.content,
+                    conversation_id=str(conversation_id),
+                    history=history,
+                    toolbox=toolbox,
+                    model=model,
+                    provider=provider,
+                    tool_context={
+                        "collection_id": collection_id,
+                        "top_k": payload.retrieval_top_k,
+                    },
+                )
     except Exception as exc:
         logger.exception("Agent execution failed for conversation %s", conversation_id)
         run.status = "failed"
@@ -140,6 +149,7 @@ async def chat(
     )
     db.add(assistant_message)
     await db.flush()
+    run.assistant_message_id = assistant_message.id
     persisted_calls: list[ToolCall] = []
     for item in result.tool_calls:
         persisted = ToolCall(
@@ -192,6 +202,7 @@ async def chat(
         resource_id=str(run.id),
         detail={
             "collection_id": collection_id or None,
+            "execution_mode": payload.execution_mode,
             "citation_count": len(result.citations),
             "verification_passed": bool(result.verification.get("passed")),
             "degraded": result.degraded_without_evidence,

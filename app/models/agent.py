@@ -43,6 +43,9 @@ class AgentRun(Base):
     user_message_id: Mapped[uuid.UUID] = mapped_column(
         ForeignKey("messages.id", ondelete="RESTRICT")
     )
+    assistant_message_id: Mapped[uuid.UUID | None] = mapped_column(
+        ForeignKey("messages.id", ondelete="SET NULL"), unique=True
+    )
     model_provider: Mapped[str] = mapped_column(String(128))
     model_name: Mapped[str] = mapped_column(String(255))
     prompt_version: Mapped[str] = mapped_column(String(128))

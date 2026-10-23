@@ -62,7 +62,7 @@ class Settings(BaseSettings):
     conversation_ttl_hours: int = Field(default=24, ge=1)
     workspace_root: Path = Path("./runtime")
     request_timeout_seconds: int = Field(default=120, ge=1, le=600)
-    max_tool_rounds: int = Field(default=4, ge=1, le=10)
+    max_tool_rounds: int = Field(default=8, ge=1, le=10)
     default_knowledge_base_id: str = ""
     retrieval_top_k: int = Field(default=8, ge=1, le=50)
     daily_request_quota: int = Field(default=100, ge=1, le=100000)

@@ -1,3 +1,5 @@
+from typing import Literal
+
 from pydantic import BaseModel, Field, model_validator
 
 
@@ -31,6 +33,7 @@ class ChatRequest(BaseModel):
     model_config_id: str | None = None
     collection_id: str | None = None
     retrieval_top_k: int = Field(default=8, ge=1, le=20)
+    execution_mode: Literal["agent", "direct"] = "agent"
 
 
 class ChatResponse(BaseModel):

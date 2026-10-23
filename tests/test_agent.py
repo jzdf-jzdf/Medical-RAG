@@ -1,13 +1,15 @@
 from app.api.chat import _exception_detail
-from app.services.agent import MedicalAgent, _parse_json_object
+from app.services.agent import MedicalAgent, _extract_knowledge_evidence, _parse_json_object
 from app.services.mcp_client import MCPToolbox, ToolDefinition, ToolOutput, _mcp_http_timeout
 
 
 class FakeModel:
     def __init__(self, replies: list[str]) -> None:
         self.replies = iter(replies)
+        self.prompts: list[str] = []
 
     async def generate(self, prompt: str, **kwargs) -> str:
+        self.prompts.append(prompt)
         return next(self.replies)
 
 
@@ -48,10 +50,16 @@ class FakeToolbox:
 
 
 async def test_agent_calls_tool_then_returns_answer() -> None:
+    semantic = (
+        '{"claims":[{"claim_id":1,"supported":true,"evidence":['
+        '{"citation_id":1,"quote":"evidence based answer"}],"reason":""}]}'
+    )
     model = FakeModel(
         [
             '{"action":"call_tool","tool":"knowledge__search","arguments":{"q":"ICH"}}',
-            '{"action":"final","answer":"evidence based answer [1]."}',
+            '{"action":"final","requires_evidence":true}',
+            "evidence based answer [1].",
+            semantic,
         ]
     )
     toolbox = FakeToolbox()
@@ -68,6 +76,8 @@ async def test_agent_calls_tool_then_returns_answer() -> None:
     assert toolbox.calls == [("knowledge__search", {"q": "ICH"})]
     assert result.tool_calls[0]["status"] == "completed"
     assert result.citations[0]["chunk_id"] == "chunk-1"
+    assert result.verification["semantic_passed"] is True
+    assert '"citation": 1' in model.prompts[2]
 
 
 async def test_agent_can_skip_retrieval_for_non_medical_question() -> None:
@@ -89,13 +99,19 @@ async def test_agent_can_skip_retrieval_for_non_medical_question() -> None:
 
 
 async def test_agent_scopes_retrieval_to_request_collection() -> None:
+    semantic = (
+        '{"claims":[{"claim_id":1,"supported":true,"evidence":['
+        '{"citation_id":1,"quote":"evidence based answer"}],"reason":""}]}'
+    )
     model = FakeModel(
         [
             (
                 '{"action":"call_tool","tool":"knowledge__search","arguments":'
                 '{"collection_id":"wrong","query":"ICH"}}'
             ),
-            '{"action":"final","answer":"evidence based answer [1]."}',
+            '{"action":"final","requires_evidence":true}',
+            "evidence based answer [1].",
+            semantic,
         ]
     )
     toolbox = FakeToolbox()
@@ -116,6 +132,29 @@ async def test_agent_scopes_retrieval_to_request_collection() -> None:
     ]
 
 
+async def test_verification_failure_is_metadata_not_answer_text() -> None:
+    model = FakeModel(
+        [
+            '{"action":"call_tool","tool":"knowledge__search","arguments":{}}',
+            '{"action":"final","requires_evidence":true}',
+            "the dose is 30 mg [1].",
+            '{"claims":[{"claim_id":1,"supported":false,"evidence":[],"reason":"剂量不符"}]}',
+        ]
+    )
+    result = await MedicalAgent(model).run(
+        question="dose",
+        conversation_id="conversation",
+        history=[],
+        toolbox=FakeToolbox(),
+        model="deepseek-chat",
+        provider="deepseek",
+    )
+
+    assert result.verification["passed"] is False
+    assert "numeric_mismatch" in result.verification["issues"]
+    assert "引用核验未通过" not in result.answer
+
+
 async def test_agent_marks_no_tool_answer_as_unverified() -> None:
     result = await MedicalAgent(FakeModel(["general answer"])).run(
         question="question",
@@ -134,6 +173,35 @@ def test_parse_json_from_markdown_fence() -> None:
         "action": "final",
         "answer": "ok",
     }
+
+
+def test_retrieved_chunks_receive_one_global_deduplicated_order() -> None:
+    calls = [
+        {
+            "tool": "search_medical_knowledge",
+            "is_error": False,
+            "result": {
+                "items": [
+                    {"chunk_id": "chunk-1", "content": "first"},
+                    {"chunk_id": "chunk-2", "content": "second"},
+                ]
+            },
+        },
+        {
+            "tool": "hybrid_search",
+            "is_error": False,
+            "result": {
+                "items": [
+                    {"chunk_id": "chunk-1", "content": "duplicate"},
+                    {"chunk_id": "chunk-3", "content": "third"},
+                ]
+            },
+        },
+    ]
+
+    citations, _ = _extract_knowledge_evidence(calls)
+
+    assert [item["chunk_id"] for item in citations] == ["chunk-1", "chunk-2", "chunk-3"]
 
 
 def test_exception_detail_unwraps_nested_task_group_error() -> None:

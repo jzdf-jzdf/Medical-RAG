@@ -1,4 +1,8 @@
-from app.services.verification import compact_citations, verify_answer
+from app.services.verification import (
+    compact_citations,
+    validate_semantic_verification,
+    verify_answer,
+)
 
 
 def test_compacts_used_sources_and_verifies_supported_numbers() -> None:
@@ -23,3 +27,42 @@ def test_rejects_uncited_claim_and_numeric_mismatch() -> None:
     assert result["passed"] is False
     assert "numeric_mismatch" in result["issues"]
     assert "uncited_claim" in result["issues"]
+
+
+def test_semantic_verification_requires_exact_source_quote() -> None:
+    answer = "建议将收缩压降至140 mmHg [1]。"
+    citations = [{"text": "急性期将收缩压降至 140 mmHg 是安全的。"}]
+
+    accepted = validate_semantic_verification(
+        answer,
+        citations,
+        {
+            "claims": [
+                {
+                    "claim_id": 1,
+                    "supported": True,
+                    "evidence": [
+                        {"citation_id": 1, "quote": "将收缩压降至 140 mmHg 是安全的"}
+                    ],
+                }
+            ]
+        },
+    )
+    rejected = validate_semantic_verification(
+        answer,
+        citations,
+        {
+            "claims": [
+                {
+                    "claim_id": 1,
+                    "supported": True,
+                    "evidence": [{"citation_id": 1, "quote": "建议降到120 mmHg"}],
+                }
+            ]
+        },
+    )
+
+    assert accepted["passed"] is True
+    assert accepted["claims"][0]["evidence"][0]["citation_id"] == 1
+    assert rejected["passed"] is False
+    assert "semantic_mismatch" in rejected["issues"]

@@ -9,7 +9,13 @@ from time import perf_counter
 from typing import Any, Protocol
 
 from app.services.mcp_client import ToolDefinition, ToolOutput
-from app.services.verification import compact_citations, normalize_citations, verify_answer
+from app.services.verification import (
+    compact_citations,
+    extract_claims,
+    normalize_citations,
+    validate_semantic_verification,
+    verify_answer,
+)
 
 
 class ModelRunner(Protocol):
@@ -40,7 +46,7 @@ class AgentResult:
 
 
 class MedicalAgent:
-    def __init__(self, model_runner: ModelRunner, max_tool_rounds: int = 4) -> None:
+    def __init__(self, model_runner: ModelRunner, max_tool_rounds: int = 8) -> None:
         self.model_runner = model_runner
         self.max_tool_rounds = max(1, max_tool_rounds)
 
@@ -81,6 +87,15 @@ class MedicalAgent:
             decision = _parse_json_object(raw)
             if not decision or decision.get("action") == "final":
                 answer = str(decision.get("answer") or raw) if decision else raw
+                if _extract_knowledge_evidence(calls)[0]:
+                    return await self._complete_evidence_answer(
+                        question=question,
+                        history=history,
+                        calls=calls,
+                        conversation_id=conversation_id,
+                        model=model,
+                        provider=provider,
+                    )
                 return _finalize_answer(
                     answer,
                     calls,
@@ -117,6 +132,15 @@ class MedicalAgent:
             calls.append(record)
             observations.append({**record, "result": output.for_model()})
 
+        if _extract_knowledge_evidence(calls)[0]:
+            return await self._complete_evidence_answer(
+                question=question,
+                history=history,
+                calls=calls,
+                conversation_id=conversation_id,
+                model=model,
+                provider=provider,
+            )
         answer = await self.model_runner.generate(
             _answer_prompt(question, history, observations),
             conversation_id=conversation_id,
@@ -124,6 +148,50 @@ class MedicalAgent:
             provider=provider,
         )
         return _finalize_answer(answer, calls, requires_evidence=True)
+
+    async def _complete_evidence_answer(
+        self,
+        *,
+        question: str,
+        history: list[dict[str, str]],
+        calls: list[dict[str, Any]],
+        conversation_id: str,
+        model: str,
+        provider: str,
+    ) -> AgentResult:
+        citations, _ = _extract_knowledge_evidence(calls)
+        answer = await self.model_runner.generate(
+            _evidence_answer_prompt(question, history, citations),
+            conversation_id=conversation_id,
+            model=model,
+            provider=provider,
+        )
+        result = _finalize_answer(answer, calls, requires_evidence=True)
+        if not result.citations:
+            return result
+        try:
+            raw_verification = await self.model_runner.generate(
+                _semantic_verification_prompt(result.answer, result.citations),
+                conversation_id=conversation_id,
+                model=model,
+                provider=provider,
+            )
+            payload = _parse_json_object(raw_verification)
+        except Exception:
+            payload = None
+        semantic = validate_semantic_verification(result.answer, result.citations, payload)
+        issues = sorted(set(result.verification.get("issues", []) + semantic["issues"]))
+        result.verification.update(
+            {
+                "passed": bool(result.verification.get("passed")) and semantic["passed"],
+                "issues": issues,
+                "semantic_passed": semantic["passed"],
+                "claims": semantic["claims"],
+                "supported_claims": semantic["supported_claims"],
+            }
+        )
+        result.degraded_without_evidence = not result.verification["passed"]
+        return result
 
 
 def _decision_prompt(
@@ -140,8 +208,9 @@ def _decision_prompt(
     return (
         "你正在执行医疗问答工具决策。只输出一个 JSON 对象，不要使用 Markdown。\n"
         '需要调用工具：{"action":"call_tool","tool":"工具名","arguments":{}}\n'
-        '无需继续调用：{"action":"final","requires_evidence":false,"answer":"最终回答"}\n'
+        '无需继续调用：{"action":"final","requires_evidence":true}\n'
         "问候、致谢、界面使用方法等不含医学事实的问题无需检索。\n"
+        "仅在无需检索时，可在 final 对象中增加 answer 并将 requires_evidence 设为 false。\n"
         "疾病、诊断、治疗、用药、剂量、数值、风险、指南或临床决策问题必须先调用知识库检索工具。\n"
         "获得检索结果后，回答中每个医学事实句末必须使用 [1]、[2] 等来源编号。\n"
         "只能调用给定工具，不得伪造工具结果。\n"
@@ -186,10 +255,40 @@ def _evidence_answer_prompt(
     ]
     return (
         "你是循证医学问答助手。只能依据给定来源作答；证据不足时明确拒答。\n"
+        "来源数组中的 citation 是后端分配的全局唯一编号，必须严格按该编号引用。\n"
         "每个事实性句子末尾必须添加一个或多个来源编号，如 [1] 或 [1][2]。\n"
         "数字、单位、条件、适用人群不得超出来源；不要编造来源编号；不要输出 JSON。\n"
         f"对话历史：{json.dumps(history, ensure_ascii=False)}\n"
         f"用户问题：{question}\n"
+        f"来源：{json.dumps(sources, ensure_ascii=False, default=str)}"
+    )
+
+
+def _semantic_verification_prompt(
+    answer: str, citations: list[dict[str, Any]]
+) -> str:
+    claims = [
+        {
+            "claim_id": item["claim_id"],
+            "text": item["text"],
+            "citation_ids": item["citation_ids"],
+        }
+        for item in extract_claims(answer)
+        if item["requires_support"] or item["citation_ids"]
+    ]
+    sources = [
+        {"citation_id": index, "text": source.get("text") or ""}
+        for index, source in enumerate(citations, start=1)
+    ]
+    return (
+        "你是严格的医学证据核验器。只输出 JSON 对象，不要输出 Markdown。\n"
+        "逐条判断陈述是否被它标注的来源直接支持，不得使用常识补全。\n"
+        "supported=true 时，evidence 必须至少包含一条来源中的连续逐字原文；"
+        "quote 不得改写，citation_id 必须来自该陈述的 citation_ids。\n"
+        "输出格式："
+        '{"claims":[{"claim_id":1,"supported":true,'
+        '"evidence":[{"citation_id":1,"quote":"逐字原文"}],"reason":""}]}\n'
+        f"陈述：{json.dumps(claims, ensure_ascii=False)}\n"
         f"来源：{json.dumps(sources, ensure_ascii=False, default=str)}"
     )
 
@@ -223,8 +322,6 @@ def _finalize_answer(
         answer, citations = compact_citations(answer, citations)
         verification = verify_answer(answer, citations)
         degraded = not verification["passed"]
-        if degraded:
-            answer = _with_verification_notice(answer, verification)
         return AgentResult(
             answer=answer,
             tool_calls=calls,
@@ -255,6 +352,7 @@ def _extract_knowledge_evidence(
 ) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
     citations: list[dict[str, Any]] = []
     trace: list[dict[str, Any]] = []
+    seen_chunks: set[str] = set()
     for call in calls:
         if call["is_error"] or call["tool"] not in {
             "search_medical_knowledge",
@@ -272,6 +370,11 @@ def _extract_knowledge_evidence(
         for item in items:
             if not isinstance(item, dict):
                 continue
+            chunk_id = str(item.get("chunk_id") or "")
+            if chunk_id and chunk_id in seen_chunks:
+                continue
+            if chunk_id:
+                seen_chunks.add(chunk_id)
             citations.append(
                 {
                     "document_id": item.get("document_id"),
@@ -315,9 +418,3 @@ def _parse_json_object(raw: str) -> dict[str, Any] | None:
 def _with_unverified_notice(answer: str) -> str:
     notice = "\n\n> 未经文献验证：本轮未获得有效的工具证据，请勿将回答直接用于临床决策。"
     return answer if "未经文献验证" in answer else answer.rstrip() + notice
-
-
-def _with_verification_notice(answer: str, verification: dict[str, Any]) -> str:
-    issues = "、".join(verification.get("issues") or ["引用核验未通过"])
-    notice = f"\n\n> 引用核验未通过（{issues}）：请复核原始证据后再用于临床决策。"
-    return answer if "引用核验未通过" in answer else answer.rstrip() + notice

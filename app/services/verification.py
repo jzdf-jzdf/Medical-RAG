@@ -40,14 +40,10 @@ def verify_answer(answer: str, citations: list[dict[str, Any]]) -> dict[str, Any
     answer = normalize_citations(answer)
     issues: list[str] = []
     supported_claims = 0
-    claims = [
-        part.strip()
-        for part in re.split(r"(?<=[。！？；;])|\n+", answer)
-        if part.strip()
-    ]
+    claims = extract_claims(answer)
     for claim in claims:
-        ids = [int(value) for value in CITATION_RE.findall(claim)]
-        plain = CITATION_RE.sub("", claim).strip(" #*-:：")
+        ids = claim["citation_ids"]
+        plain = claim["text"]
         if not ids:
             if len(plain) > 12:
                 issues.append("uncited_claim")
@@ -77,4 +73,89 @@ def verify_answer(answer: str, citations: list[dict[str, Any]]) -> dict[str, Any
         "claim_count": len(claims),
         "supported_claims": supported_claims,
         "citation_count": len(citations),
+    }
+
+
+def extract_claims(answer: str) -> list[dict[str, Any]]:
+    claims: list[dict[str, Any]] = []
+    for part in re.split(r"(?<=[。！？；;])|\n+", normalize_citations(answer)):
+        raw = part.strip()
+        if not raw:
+            continue
+        plain = CITATION_RE.sub("", raw).strip(" #*-:：")
+        claims.append(
+            {
+                "claim_id": len(claims) + 1,
+                "text": plain,
+                "citation_ids": [int(value) for value in CITATION_RE.findall(raw)],
+                "requires_support": len(plain) > 12,
+            }
+        )
+    return claims
+
+
+def validate_semantic_verification(
+    answer: str,
+    citations: list[dict[str, Any]],
+    payload: dict[str, Any] | None,
+) -> dict[str, Any]:
+    claims = [
+        claim
+        for claim in extract_claims(answer)
+        if claim["requires_support"] or claim["citation_ids"]
+    ]
+    raw_reports = (payload or {}).get("claims")
+    reports = raw_reports if isinstance(raw_reports, list) else []
+    reported = {
+        item.get("claim_id"): item
+        for item in reports
+        if isinstance(item, dict) and isinstance(item.get("claim_id"), int)
+    }
+    results: list[dict[str, Any]] = []
+    issues: list[str] = []
+    for claim in claims:
+        report = reported.get(claim["claim_id"], {})
+        evidence: list[dict[str, Any]] = []
+        for item in report.get("evidence", []) if isinstance(report, dict) else []:
+            if not isinstance(item, dict):
+                continue
+            citation_id = item.get("citation_id")
+            quote = str(item.get("quote") or "").strip()
+            if (
+                isinstance(citation_id, int)
+                and citation_id in claim["citation_ids"]
+                and 1 <= citation_id <= len(citations)
+                and quote
+                and quote in str(citations[citation_id - 1].get("text") or "")
+            ):
+                evidence.append({"citation_id": citation_id, "quote": quote})
+
+        supported = bool(report.get("supported")) and bool(evidence)
+        reason = str(report.get("reason") or "").strip()
+        if not claim["citation_ids"]:
+            supported = False
+            reason = reason or "陈述没有引用来源"
+        elif not evidence:
+            reason = reason or "未找到可在来源原文中定位的证据"
+        if not supported:
+            issues.append("semantic_mismatch")
+        results.append(
+            {
+                "claim_id": claim["claim_id"],
+                "text": claim["text"],
+                "citation_ids": claim["citation_ids"],
+                "supported": supported,
+                "evidence": evidence,
+                "reason": reason,
+            }
+        )
+
+    if payload is None:
+        issues.append("semantic_verification_failed")
+    unique_issues = sorted(set(issues))
+    return {
+        "passed": bool(results) and not unique_issues,
+        "issues": unique_issues,
+        "claims": results,
+        "supported_claims": sum(1 for item in results if item["supported"]),
     }

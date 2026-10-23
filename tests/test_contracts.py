@@ -5,7 +5,7 @@ from pydantic import ValidationError
 
 from app.core.config import MCPServerSettings
 from app.main import app
-from app.schemas.evidence import CitationCandidate
+from app.schemas.evidence import ChatRequest, CitationCandidate
 from app.services.mcp import MCPOrchestrator
 
 
@@ -21,6 +21,19 @@ def test_partial_knowledge_identity_is_rejected() -> None:
     except ValidationError:
         return
     raise AssertionError("partial stable identity must be rejected")
+
+
+def test_chat_request_defaults_to_agent_and_accepts_direct_mode() -> None:
+    default = ChatRequest(conversation_id="conversation", user_id="user", content="question")
+    direct = ChatRequest(
+        conversation_id="conversation",
+        user_id="user",
+        content="question",
+        execution_mode="direct",
+    )
+
+    assert default.execution_mode == "agent"
+    assert direct.execution_mode == "direct"
 
 
 async def test_mcp_partial_failure_is_isolated() -> None:

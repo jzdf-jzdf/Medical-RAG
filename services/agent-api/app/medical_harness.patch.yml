@@ -1,0 +1,4 @@
+- id: system-prompt
+  config:
+    personaPrefix: !!js process.env.MEDICAL_SYSTEM_PROMPT
+    personaSuffix: ""

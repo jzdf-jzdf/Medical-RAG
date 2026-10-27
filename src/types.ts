@@ -94,3 +94,28 @@ export interface QuestionInput {
   evidence?: Record<string, unknown>[]
   metadata?: Record<string, unknown>
 }
+export interface TestRunSummary {
+  id: string
+  bank_id: string
+  bank_name: string
+  status: string
+  total_questions: number
+  completed_questions: number
+  started_at: string
+  finished_at?: string | null
+}
+export interface TestQuestionResult {
+  id: string
+  question_id: string
+  prompt: string
+  question_type: QuestionType
+  options: ChoiceOption[]
+  correct_answer?: string | null
+  status: string
+  answer?: string | null
+  agent_run_id?: string | null
+  metrics: Record<string, unknown>
+  overall_score?: number | null
+  error?: string | null
+}
+export interface TestRunDetail extends TestRunSummary { results: TestQuestionResult[] }

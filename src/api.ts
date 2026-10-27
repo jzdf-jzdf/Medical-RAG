@@ -1,6 +1,7 @@
 import type {
   DocumentChunks, GeneratedQuestionBatch, KnowledgeBaseSummary, QuestionBankDetail,
   QuestionBankSummary, QuestionInput, QuestionStyle, QuestionType, StoredQuestion,
+  TestRunDetail, TestRunSummary,
 } from './types'
 
 const API_BASE = '/api/evaluation/api/v1'
@@ -59,4 +60,9 @@ export const generateQuestions = (payload: {
   instructions?: string
 }) => request<GeneratedQuestionBatch>('/questions/generate', {
   method: 'POST', body: JSON.stringify(payload),
+})
+export const fetchTestRuns = () => request<TestRunSummary[]>('/test-runs')
+export const fetchTestRun = (id: string) => request<TestRunDetail>(`/test-runs/${encodeURIComponent(id)}`)
+export const createTestRun = (bankId: string, collectionId: string) => request<TestRunDetail>('/test-runs', {
+  method: 'POST', body: JSON.stringify({ bank_id: bankId, collection_id: collectionId }),
 })

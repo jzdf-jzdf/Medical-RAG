@@ -1,4 +1,4 @@
 import { createApp } from 'vue'
 import './styles.css'
-import App from './App.vue'
-createApp(App).mount('#app')
+import Root from './Root.vue'
+createApp(Root).mount('#app')

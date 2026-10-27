@@ -1,16 +1,19 @@
 <script setup lang="ts">
 import { computed, onBeforeUnmount, onMounted, reactive, ref, shallowRef } from 'vue'
+import AccountMenu from './components/AccountMenu.vue'
 
 import {
   createQuestion, createQuestionBank, createQuestionsBulk, fetchDocumentChunks,
-  fetchKnowledgeBases, fetchQuestionBank, fetchQuestionBanks, fetchQuestions, generateQuestions,
+  createTestRun, fetchKnowledgeBases, fetchQuestionBank, fetchQuestionBanks, fetchQuestions,
+  fetchTestRun, fetchTestRuns, generateQuestions,
 } from './api'
 import type {
   DocumentChunks, GeneratedQuestion, KnowledgeBaseSummary, QuestionBankDetail,
   QuestionBankSummary, QuestionInput, QuestionStyle, QuestionType, StoredQuestion,
+  TestQuestionResult, TestRunDetail, TestRunSummary,
 } from './types'
 
-type View = 'banks' | 'questions' | 'generate' | 'bank'
+type View = 'banks' | 'questions' | 'generate' | 'test' | 'bank'
 type Notice = { kind: 'success' | 'error'; text: string }
 
 const activeView = ref<View>('banks')
@@ -67,6 +70,13 @@ const generating = ref(false)
 const generationError = ref('')
 const targetBankId = ref('')
 const savingGenerated = ref(false)
+const testRuns = ref<TestRunSummary[]>([])
+const activeTestRun = shallowRef<TestRunDetail | null>(null)
+const selectedTestBankId = ref('')
+const selectedTestKnowledgeBaseId = ref('')
+const loadingTestRuns = ref(false)
+const runningTest = ref(false)
+const testError = ref('')
 
 const styles: Array<{ value: QuestionStyle; label: string; hint: string }> = [
   { value: 'patient', label: '患者', hint: '就诊者或家属自然提问' },
@@ -76,6 +86,10 @@ const styles: Array<{ value: QuestionStyle; label: string; hint: string }> = [
 ]
 
 const totalQuestions = computed(() => banks.value.reduce((sum, item) => sum + item.question_count, 0))
+const selectedTestBank = computed(() => banks.value.find((item) => item.id === selectedTestBankId.value))
+const selectedTestKnowledgeBase = computed(() =>
+  knowledgeBases.value.find((item) => item.id === selectedTestKnowledgeBaseId.value),
+)
 const selectedKnowledgeBase = computed(() =>
   knowledgeBases.value.find((item) => item.id === selectedKnowledgeBaseId.value),
 )
@@ -139,7 +153,7 @@ function syncHash() {
     if (id && id !== selectedBank.value?.id) void openBank(id, false)
     return
   }
-  if (['banks', 'questions', 'generate'].includes(hash)) {
+  if (['banks', 'questions', 'generate', 'test'].includes(hash)) {
     activeView.value = hash as View
     selectedBank.value = null
   }
@@ -150,6 +164,7 @@ async function loadBanks() {
   try {
     banks.value = await fetchQuestionBanks()
     if (!targetBankId.value && banks.value.length) targetBankId.value = banks.value[0].id
+    if (!selectedTestBankId.value && banks.value.length) selectedTestBankId.value = banks.value[0].id
   } finally {
     loadingBanks.value = false
   }
@@ -164,11 +179,50 @@ async function loadQuestions() {
   }
 }
 
+async function loadTestRuns() {
+  loadingTestRuns.value = true
+  try {
+    testRuns.value = await fetchTestRuns()
+  } catch (error) {
+    testError.value = messageOf(error)
+  } finally {
+    loadingTestRuns.value = false
+  }
+}
+
+async function openTestRun(id: string) {
+  testError.value = ''
+  try {
+    activeTestRun.value = await fetchTestRun(id)
+  } catch (error) {
+    testError.value = messageOf(error)
+  }
+}
+
+async function startBankTest() {
+  if (!selectedTestBankId.value || !selectedTestBank.value?.question_count || !selectedTestKnowledgeBaseId.value) return
+  runningTest.value = true
+  testError.value = ''
+  activeTestRun.value = null
+  try {
+    activeTestRun.value = await createTestRun(selectedTestBankId.value, selectedTestKnowledgeBaseId.value)
+    await loadTestRuns()
+    showNotice('success', `“${activeTestRun.value.bank_name}”测试已完成`)
+  } catch (error) {
+    testError.value = messageOf(error)
+  } finally {
+    runningTest.value = false
+  }
+}
+
 async function loadCatalog() {
   loadingCatalog.value = true
   catalogError.value = ''
   try {
     knowledgeBases.value = await fetchKnowledgeBases()
+    if (!knowledgeBases.value.some((item) => item.id === selectedTestKnowledgeBaseId.value)) {
+      selectedTestKnowledgeBaseId.value = knowledgeBases.value[0]?.id ?? ''
+    }
     selectedKnowledgeBaseId.value = knowledgeBases.value[0]?.id ?? ''
     syncDocument()
     if (selectedDocumentId.value) await loadChunks()
@@ -364,6 +418,30 @@ function typeLabel(type: QuestionType) {
   return type === 'qa' ? '问答题' : '单选题'
 }
 
+function testResultLabel(result: TestQuestionResult) {
+  if (result.status !== 'completed') return '本题调用失败'
+  const answer = result.metrics.answer as {
+    score?: number
+    metrics?: { selected_option?: string | null }
+  } | undefined
+  if (result.question_type === 'single_choice') {
+    const selected = selectedOptionFor(result)
+    if (!selected) return `未识别选项 · 正确答案 ${result.correct_answer || '未设置'}`
+    return selected === result.correct_answer
+      ? `选择正确：${selected}`
+      : `选择错误：${selected} · 正确答案 ${result.correct_answer || '未设置'}`
+  }
+  const answerScore = answer?.score
+  return `答案匹配度 ${answerScore == null ? '—' : `${Math.round(answerScore * 100)}%`}`
+}
+
+function selectedOptionFor(result: TestQuestionResult) {
+  const answer = result.metrics.answer as {
+    metrics?: { selected_option?: string | null }
+  } | undefined
+  return answer?.metrics?.selected_option ?? null
+}
+
 function styleLabel(style: unknown) {
   return styles.find((item) => item.value === style)?.label || '未指定'
 }
@@ -376,7 +454,7 @@ function formatDate(value: string) {
 onMounted(async () => {
   window.addEventListener('hashchange', syncHash)
   try {
-    await Promise.all([loadBanks(), loadQuestions(), loadCatalog()])
+    await Promise.all([loadBanks(), loadQuestions(), loadCatalog(), loadTestRuns()])
   } catch (error) {
     loadError.value = messageOf(error)
   }
@@ -418,21 +496,22 @@ onBeforeUnmount(() => {
           <svg viewBox="0 0 24 24"><path d="m12 3 1.4 4.1L17.5 8.5l-4.1 1.4L12 14l-1.4-4.1-4.1-1.4 4.1-1.4zM18 14l.8 2.2L21 17l-2.2.8L18 20l-.8-2.2L15 17l2.2-.8z" /></svg>
           <span><b>生成题目</b><small>从知识分块出题</small></span>
         </button>
+        <button :class="{ active: activeView === 'test' }" type="button" @click="navigate('test')">
+          <svg viewBox="0 0 24 24"><path d="M5 4h14v16H5zM8 8l1.5 1.5L12 7m1 2h3m-8 4 1.5 1.5L12 11m1 2h3m-5 3h5" /></svg>
+          <span><b>测试执行</b><small>{{ testRuns.length }} 次测试记录</small></span>
+        </button>
       </nav>
 
-      <div class="sidebar-foot">
-        <span><i></i>评测服务已连接</span>
-        <p>题目与来源证据统一归档，作为后续评测的数据基础。</p>
-      </div>
+      <AccountMenu />
     </aside>
 
     <div class="app-shell">
       <header class="topbar">
         <div>
           <span>评测中心</span>
-          <strong>{{ activeView === 'generate' ? '证据出题' : activeView === 'questions' ? '题目总览' : activeView === 'bank' ? '题库详情' : '题库管理' }}</strong>
+          <strong>{{ activeView === 'generate' ? '证据出题' : activeView === 'questions' ? '题目总览' : activeView === 'test' ? '题库测试' : activeView === 'bank' ? '题库详情' : '题库管理' }}</strong>
         </div>
-        <button v-if="activeView !== 'generate'" class="top-create" type="button" @click="showBankDialog = true">＋ 创建题库</button>
+        <button v-if="!['generate', 'test'].includes(activeView)" class="top-create" type="button" @click="showBankDialog = true">＋ 创建题库</button>
       </header>
 
       <main id="main-content" class="main-content" tabindex="-1">
@@ -532,6 +611,49 @@ onBeforeUnmount(() => {
               </div>
             </article>
           </div>
+        </section>
+
+        <section v-else-if="activeView === 'test'" class="page-section test-page">
+          <div class="page-heading">
+            <div><span class="eyebrow">Question bank evaluation</span><h1>题库测试</h1><p>选择题库，将其中已保存的问题逐题提交给 Agent，并查看回答与评测结果。</p></div>
+          </div>
+          <section class="test-launch-panel">
+            <div class="test-launch-copy"><span class="test-launch-index">01</span><div><h2>选择要测试的题库</h2><p>测试会使用题库内全部题目，测试过程和逐题结果会保存到评测记录。</p></div></div>
+            <div class="test-launch-controls">
+              <label><span>题库</span><select v-model="selectedTestBankId" :disabled="!banks.length || runningTest"><option v-if="!banks.length" value="">暂无题库</option><option v-for="bank in banks" :key="bank.id" :value="bank.id">{{ bank.name }}</option></select></label>
+              <label><span>知识库</span><select v-model="selectedTestKnowledgeBaseId" :disabled="!knowledgeBases.length || loadingCatalog || runningTest"><option v-if="loadingCatalog" value="">正在加载知识库…</option><option v-else-if="!knowledgeBases.length" value="">暂无知识库</option><option v-for="item in knowledgeBases" :key="item.id" :value="item.id">{{ item.name }}</option></select></label>
+              <div class="test-bank-stats"><span><b>{{ selectedTestBank?.question_count || 0 }}</b> 道题目</span><span><b>{{ selectedTestBank?.qa_count || 0 }}</b> 问答</span><span><b>{{ selectedTestBank?.choice_count || 0 }}</b> 单选</span></div>
+              <button class="primary-button" type="button" :disabled="!selectedTestBank?.question_count || !selectedTestKnowledgeBaseId || loadingCatalog || runningTest" @click="startBankTest">{{ runningTest ? '正在逐题调用 Agent…' : '开始测试题库' }}</button>
+            </div>
+            <p v-if="!banks.length" class="test-help">请先创建题库并加入题目，再开始测试。</p>
+            <p v-else-if="!selectedTestBank?.question_count" class="test-help">当前题库没有题目，无法开始测试。</p>
+            <div v-if="catalogError" class="inline-error" role="alert">{{ catalogError }}<button type="button" @click="loadCatalog">重试加载知识库</button></div>
+            <p v-else-if="!loadingCatalog && !knowledgeBases.length" class="test-help">当前没有可用知识库，请先在知识服务中创建并索引知识库。</p>
+            <p v-else-if="selectedTestKnowledgeBase" class="test-help">Agent 将使用“{{ selectedTestKnowledgeBase.name }}”进行检索。</p>
+          </section>
+          <div v-if="testError" class="inline-error" role="alert">{{ testError }}<button type="button" @click="loadTestRuns">重试读取记录</button></div>
+
+          <section v-if="activeTestRun" class="test-results">
+            <div class="section-line"><h2>测试结果 · {{ activeTestRun.bank_name }}</h2><span>{{ activeTestRun.completed_questions }} / {{ activeTestRun.total_questions }} 道已完成</span></div>
+            <div class="test-run-summary"><span>状态：{{ activeTestRun.status === 'completed' ? '已完成' : activeTestRun.status === 'partial' ? '部分失败' : '失败' }}</span><span>开始于 {{ formatDate(activeTestRun.started_at) }}</span></div>
+            <div class="question-list test-result-list">
+              <article v-for="(result, index) in activeTestRun.results" :key="result.id">
+                <div class="test-result-row"><span class="question-number">{{ String(index + 1).padStart(2, '0') }}</span><span class="test-result-copy"><span class="test-result-question-heading"><i class="type-badge" :class="result.question_type">{{ typeLabel(result.question_type) }}</i><b>{{ result.prompt }}</b></span><small>{{ testResultLabel(result) }}</small></span><span v-if="result.overall_score != null" class="test-score"><small>综合</small>{{ Math.round(result.overall_score * 100) }}%</span></div>
+                <div v-if="result.question_type === 'single_choice' && result.options.length" class="test-result-options option-list"><span v-for="option in result.options" :key="option.key" :class="{ correct: option.key === result.correct_answer, chosen: option.key === selectedOptionFor(result) }"><b>{{ option.key }}</b>{{ option.text }}<small v-if="option.key === result.correct_answer">正确答案</small><small v-if="option.key === selectedOptionFor(result)">Agent 选择</small></span></div>
+                <div v-if="result.answer" class="test-answer"><small>{{ result.question_type === 'single_choice' ? 'Agent 作答说明' : 'Agent 回答' }}</small><p>{{ result.answer }}</p></div>
+                <p v-if="result.error" class="test-result-error">{{ result.error }}</p>
+              </article>
+            </div>
+          </section>
+
+          <section class="test-history">
+            <div class="section-line"><h2>最近测试</h2><span>最多显示 50 次</span></div>
+            <div v-if="loadingTestRuns" class="list-loading">正在读取测试记录…</div>
+            <div v-else-if="!testRuns.length" class="empty-list"><b>还没有测试记录</b><span>选择一个包含题目的题库，开始第一次测试。</span></div>
+            <div v-else class="test-history-list">
+              <button v-for="run in testRuns" :key="run.id" type="button" :class="{ active: activeTestRun?.id === run.id }" @click="openTestRun(run.id)"><span><b>{{ run.bank_name }}</b><small>{{ formatDate(run.started_at) }} · {{ run.completed_questions }}/{{ run.total_questions }} 道已完成</small></span><i>{{ run.status === 'completed' ? '已完成' : run.status === 'partial' ? '部分失败' : run.status === 'failed' ? '失败' : run.status }}</i></button>
+            </div>
+          </section>
         </section>
 
         <section v-else class="generation-page">

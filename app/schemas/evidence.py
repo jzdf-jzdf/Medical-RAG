@@ -39,7 +39,8 @@ class ChatRequest(BaseModel):
 class ChatResponse(BaseModel):
     run_id: str
     message_id: str
-    content: str
+    content: str = Field(min_length=1)
+    status: Literal["completed", "failed"] = "completed"
     citations: list[dict]
     degraded_without_evidence: bool
     model: str

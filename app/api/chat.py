@@ -15,7 +15,7 @@ from app.core.security import enforce_user
 from app.db.session import get_db
 from app.models import AgentRun, AnswerCitation, Conversation, Message, ModelConfig, ToolCall
 from app.schemas.evidence import ChatRequest, ChatResponse
-from app.services.agent import AgentResult, MedicalAgent
+from app.services.agent import AgentResult, MedicalAgent, generate_with_retry, generation_failure
 from app.services.crypto import decrypt_secret
 from app.services.governance import consume_quota, record_audit
 from app.services.harness import HarnessService
@@ -100,7 +100,7 @@ async def chat(
         user_message_id=user_message.id,
         model_provider=provider,
         model_name=model,
-        prompt_version="medical-v2",
+        prompt_version="medical-v3-focused",
         skill_version="global-citations-semantic-v1",
         status="running",
     )
@@ -111,13 +111,21 @@ async def chat(
     collection_id = payload.collection_id or settings.default_knowledge_base_id
     try:
         if payload.execution_mode == "direct":
-            answer = await harness.generate(
+            model_trace: list[dict] = []
+            answer = await generate_with_retry(
+                harness,
                 payload.content,
                 conversation_id=str(conversation_id),
                 model=model,
                 provider=provider,
+                phase="direct_answer",
+                trace=model_trace,
             )
-            result = AgentResult(answer=answer)
+            result = (
+                AgentResult(answer=answer, trace=model_trace)
+                if answer
+                else generation_failure(trace=model_trace)
+            )
         else:
             agent = MedicalAgent(harness, settings.max_tool_rounds)
             async with MCPToolbox(settings.mcp_servers_json) as toolbox:
@@ -135,12 +143,12 @@ async def chat(
                 )
     except Exception as exc:
         logger.exception("Agent execution failed for conversation %s", conversation_id)
-        run.status = "failed"
-        run.finished_at = datetime.now(UTC)
-        await db.commit()
-        raise HTTPException(
-            status_code=502, detail=f"Agent execution failed: {_exception_detail(exc)}"
-        ) from exc
+        result = generation_failure(
+            trace=[{"stage": "execution", "status": "failed", "error": _exception_detail(exc)}]
+        )
+
+    if not result.answer.strip():
+        result = generation_failure(calls=result.tool_calls, trace=result.trace)
 
     assistant_message = Message(
         conversation_id=conversation_id,
@@ -153,15 +161,15 @@ async def chat(
     persisted_calls: list[ToolCall] = []
     for item in result.tool_calls:
         persisted = ToolCall(
-                agent_run_id=run.id,
-                mcp_server=item["server"],
-                tool_name=item["tool"],
-                arguments=item["arguments"],
-                result={"content": item["result"]},
-                result_hash=item["result_hash"],
-                latency_ms=item["latency_ms"],
-                status=item["status"],
-            )
+            agent_run_id=run.id,
+            mcp_server=item["server"],
+            tool_name=item["tool"],
+            arguments=item["arguments"],
+            result={"content": item["result"]},
+            result_hash=item["result_hash"],
+            latency_ms=item["latency_ms"],
+            status=item["status"],
+        )
         db.add(persisted)
         persisted_calls.append(persisted)
     await db.flush()
@@ -189,7 +197,7 @@ async def chat(
                     external_source_id=None,
                 )
             )
-    run.status = "completed"
+    run.status = result.status
     run.degraded_without_evidence = result.degraded_without_evidence
     run.trace = result.trace
     run.verification = result.verification
@@ -197,7 +205,7 @@ async def chat(
     record_audit(
         db,
         user_id=payload.user_id,
-        action="agent.chat.completed",
+        action=f"agent.chat.{result.status}",
         resource_type="agent_run",
         resource_id=str(run.id),
         detail={
@@ -215,6 +223,7 @@ async def chat(
         run_id=str(run.id),
         message_id=str(assistant_message.id),
         content=result.answer,
+        status=result.status,
         citations=result.citations,
         degraded_without_evidence=result.degraded_without_evidence,
         model=model,
@@ -226,9 +235,7 @@ async def chat(
             "agent": f"/agent/?run_id={run.id}",
             "evaluation": f"/evaluation/?run_id={run.id}",
             **(
-                {"knowledge": f"/knowledge/?collection_id={collection_id}"}
-                if collection_id
-                else {}
+                {"knowledge": f"/knowledge/?collection_id={collection_id}"} if collection_id else {}
             ),
         },
     )

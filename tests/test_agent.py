@@ -4,13 +4,16 @@ from app.services.mcp_client import MCPToolbox, ToolDefinition, ToolOutput, _mcp
 
 
 class FakeModel:
-    def __init__(self, replies: list[str]) -> None:
+    def __init__(self, replies: list[str | Exception]) -> None:
         self.replies = iter(replies)
         self.prompts: list[str] = []
 
     async def generate(self, prompt: str, **kwargs) -> str:
         self.prompts.append(prompt)
-        return next(self.replies)
+        reply = next(self.replies)
+        if isinstance(reply, Exception):
+            raise reply
+        return reply
 
 
 class FakeToolbox:
@@ -50,16 +53,11 @@ class FakeToolbox:
 
 
 async def test_agent_calls_tool_then_returns_answer() -> None:
-    semantic = (
-        '{"claims":[{"claim_id":1,"supported":true,"evidence":['
-        '{"citation_id":1,"quote":"evidence based answer"}],"reason":""}]}'
-    )
     model = FakeModel(
         [
             '{"action":"call_tool","tool":"knowledge__search","arguments":{"q":"ICH"}}',
             '{"action":"final","requires_evidence":true}',
             "evidence based answer [1].",
-            semantic,
         ]
     )
     toolbox = FakeToolbox()
@@ -76,7 +74,8 @@ async def test_agent_calls_tool_then_returns_answer() -> None:
     assert toolbox.calls == [("knowledge__search", {"q": "ICH"})]
     assert result.tool_calls[0]["status"] == "completed"
     assert result.citations[0]["chunk_id"] == "chunk-1"
-    assert result.verification["semantic_passed"] is True
+    assert result.status == "completed"
+    assert len(model.prompts) == 3
     assert '"citation": 1' in model.prompts[2]
 
 
@@ -99,10 +98,6 @@ async def test_agent_can_skip_retrieval_for_non_medical_question() -> None:
 
 
 async def test_agent_scopes_retrieval_to_request_collection() -> None:
-    semantic = (
-        '{"claims":[{"claim_id":1,"supported":true,"evidence":['
-        '{"citation_id":1,"quote":"evidence based answer"}],"reason":""}]}'
-    )
     model = FakeModel(
         [
             (
@@ -111,7 +106,6 @@ async def test_agent_scopes_retrieval_to_request_collection() -> None:
             ),
             '{"action":"final","requires_evidence":true}',
             "evidence based answer [1].",
-            semantic,
         ]
     )
     toolbox = FakeToolbox()
@@ -138,7 +132,6 @@ async def test_verification_failure_is_metadata_not_answer_text() -> None:
             '{"action":"call_tool","tool":"knowledge__search","arguments":{}}',
             '{"action":"final","requires_evidence":true}',
             "the dose is 30 mg [1].",
-            '{"claims":[{"claim_id":1,"supported":false,"evidence":[],"reason":"剂量不符"}]}',
         ]
     )
     result = await MedicalAgent(model).run(
@@ -239,3 +232,94 @@ def test_mcp_http_timeout_uses_configured_value() -> None:
     assert timeout.read == 30
     assert timeout.write == 30
     assert timeout.pool == 30
+
+
+async def test_empty_evidence_answer_retries_without_repeating_retrieval() -> None:
+    model = FakeModel(
+        [
+            '{"action":"call_tool","tool":"knowledge__search","arguments":{}}',
+            '{"action":"final","requires_evidence":true}',
+            " \n ",
+            "evidence based answer [1].",
+        ]
+    )
+    toolbox = FakeToolbox()
+    result = await MedicalAgent(model).run(
+        question="question",
+        conversation_id="conversation",
+        history=[],
+        toolbox=toolbox,
+        model="deepseek-chat",
+        provider="deepseek",
+    )
+
+    assert result.answer == "evidence based answer [1]."
+    assert result.status == "completed"
+    assert len(toolbox.calls) == 1
+    attempts = [event for event in result.trace if event.get("phase") == "answer"]
+    assert [event["status"] for event in attempts] == ["empty", "completed"]
+    assert attempts[0]["raw_response"] == " \n "
+    assert all(event["latency_ms"] >= 0 for event in attempts)
+
+
+async def test_repeated_empty_answers_return_failure_and_keep_tool_results() -> None:
+    model = FakeModel(
+        [
+            '{"action":"call_tool","tool":"knowledge__search","arguments":{}}',
+            '{"action":"final","requires_evidence":true}',
+            "",
+            "  ",
+        ]
+    )
+    result = await MedicalAgent(model).run(
+        question="question",
+        conversation_id="conversation",
+        history=[],
+        toolbox=FakeToolbox(),
+        model="deepseek-chat",
+        provider="deepseek",
+    )
+
+    assert "已检索到相关资料" in result.answer
+    assert result.status == "failed"
+    assert result.verification["issues"] == ["generation_failed"]
+    assert result.tool_calls[0]["result"]["items"][0]["chunk_id"] == "chunk-1"
+    assert [event["status"] for event in result.trace[-2:]] == ["empty", "empty"]
+
+
+async def test_model_errors_exhaust_retries_and_return_visible_failure() -> None:
+    model = FakeModel([TimeoutError("model timeout"), RuntimeError("model offline")])
+    result = await MedicalAgent(model).run(
+        question="question",
+        conversation_id="conversation",
+        history=[],
+        toolbox=FakeToolbox(with_tools=False),
+        model="deepseek-chat",
+        provider="deepseek",
+    )
+
+    assert result.answer.strip()
+    assert result.status == "failed"
+    assert len(model.prompts) == 2
+    assert result.trace[0]["error"] == "TimeoutError: model timeout"
+
+
+async def test_final_decision_without_answer_generates_text_instead_of_showing_json() -> None:
+    model = FakeModel(
+        [
+            '{"action":"final","requires_evidence":false}',
+            "你好，有什么可以帮你？",
+        ]
+    )
+    result = await MedicalAgent(model).run(
+        question="你好",
+        conversation_id="conversation",
+        history=[],
+        toolbox=FakeToolbox(),
+        model="deepseek-chat",
+        provider="deepseek",
+    )
+
+    assert result.answer == "你好，有什么可以帮你？"
+    assert result.status == "completed"
+    assert '"action"' not in result.answer

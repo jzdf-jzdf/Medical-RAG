@@ -1,9 +1,10 @@
 import uuid
 from collections import defaultdict
+from datetime import UTC, datetime
 from typing import Any
 
 from fastapi import APIRouter, Depends, Header, HTTPException, Query, Request, Response, status
-from sqlalchemy import delete, func, select
+from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.security import enforce_user
@@ -40,7 +41,7 @@ async def list_conversations(
     db: AsyncSession = Depends(get_db),
 ) -> ConversationList:
     enforce_user(request, user_id)
-    predicate = Conversation.user_id == user_id
+    predicate = (Conversation.user_id == user_id) & Conversation.deleted_at.is_(None)
     total = int(
         (await db.scalar(select(func.count()).select_from(Conversation).where(predicate))) or 0
     )
@@ -86,9 +87,7 @@ async def get_conversation(
         list(
             (
                 await db.scalars(
-                    select(AgentRun).where(
-                        AgentRun.assistant_message_id.in_(assistant_message_ids)
-                    )
+                    select(AgentRun).where(AgentRun.assistant_message_id.in_(assistant_message_ids))
                 )
             ).all()
         )
@@ -133,6 +132,9 @@ async def get_conversation(
 
     stored_messages = []
     for message in messages:
+        content = message.content
+        if message.role == "assistant" and not content.strip():
+            content = "这次未生成有效回答，请重新发送问题。"
         result = None
         run = run_by_message.get(message.id)
         if run is not None:
@@ -140,7 +142,8 @@ async def get_conversation(
             result = {
                 "run_id": str(run.id),
                 "message_id": str(message.id),
-                "content": message.content,
+                "content": content,
+                "status": run.status if message.content.strip() else "failed",
                 "citations": [
                     _citation_payload(citation, run_calls)
                     for citation in citations_by_message[message.id]
@@ -160,7 +163,7 @@ async def get_conversation(
             {
                 "id": message.id,
                 "role": message.role,
-                "content": message.content,
+                "content": content,
                 "created_at": message.created_at,
                 "result": result,
             }
@@ -212,9 +215,7 @@ def _citation_payload(citation: AnswerCitation, calls: list[ToolCall]) -> dict[s
     }
 
 
-def _find_retrieved_chunk(
-    chunk_id: str | None, calls: list[ToolCall]
-) -> dict[str, Any]:
+def _find_retrieved_chunk(chunk_id: str | None, calls: list[ToolCall]) -> dict[str, Any]:
     if not chunk_id:
         return {}
     for call in calls:
@@ -243,11 +244,6 @@ async def delete_conversation(
     if conversation.user_id != user_id:
         raise HTTPException(status_code=403, detail="Conversation access denied")
 
-    message_ids = select(Message.id).where(Message.conversation_id == conversation_id)
-    await db.execute(
-        delete(AnswerCitation).where(AnswerCitation.message_id.in_(message_ids))
-    )
-    await db.execute(delete(AgentRun).where(AgentRun.conversation_id == conversation_id))
-    await db.delete(conversation)
+    conversation.deleted_at = datetime.now(UTC)
     await db.commit()
     return Response(status_code=status.HTTP_204_NO_CONTENT)

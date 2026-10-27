@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import logging
 from dataclasses import dataclass, field
 from time import perf_counter
 from typing import Any, Protocol
@@ -11,11 +12,11 @@ from typing import Any, Protocol
 from app.services.mcp_client import ToolDefinition, ToolOutput
 from app.services.verification import (
     compact_citations,
-    extract_claims,
     normalize_citations,
-    validate_semantic_verification,
     verify_answer,
 )
+
+logger = logging.getLogger(__name__)
 
 
 class ModelRunner(Protocol):
@@ -43,6 +44,73 @@ class AgentResult:
     citations: list[dict[str, Any]] = field(default_factory=list)
     verification: dict[str, Any] = field(default_factory=dict)
     trace: list[dict[str, Any]] = field(default_factory=list)
+    status: str = "completed"
+
+
+async def generate_with_retry(
+    runner: ModelRunner,
+    prompt: str,
+    *,
+    conversation_id: str,
+    model: str,
+    provider: str,
+    phase: str,
+    trace: list[dict[str, Any]],
+) -> str:
+    """Retry one empty or failed model call and retain both attempts for diagnosis."""
+    for attempt in range(1, 3):
+        started = perf_counter()
+        event: dict[str, Any] = {"stage": "model", "phase": phase, "attempt": attempt}
+        try:
+            response = await runner.generate(
+                prompt
+                if attempt == 1
+                else prompt + "\n上次未返回有效内容，请重新输出非空结果并遵守上述格式。",
+                conversation_id=conversation_id,
+                model=model,
+                provider=provider,
+            )
+            answer = response.strip() if isinstance(response, str) else ""
+            event.update(
+                status="completed" if answer else "empty",
+                raw_response=response if isinstance(response, str) else None,
+            )
+        except Exception as exc:
+            logger.warning("Model call failed: phase=%s attempt=%s", phase, attempt, exc_info=True)
+            answer = ""
+            event.update(status="failed", error=f"{type(exc).__name__}: {exc}"[:800])
+        event["latency_ms"] = round((perf_counter() - started) * 1000)
+        trace.append(event)
+        if answer:
+            return answer
+    return ""
+
+
+def generation_failure(
+    *,
+    calls: list[dict[str, Any]] | None = None,
+    trace: list[dict[str, Any]] | None = None,
+) -> AgentResult:
+    calls = calls or []
+    evidence, retrieval_trace = _extract_knowledge_evidence(calls)
+    answer = (
+        "已检索到相关资料，但本次回答生成未成功。请稍后重新发送问题。"
+        if evidence
+        else "本次回答生成未成功，模型服务可能暂时不可用。请稍后重新发送问题。"
+    )
+    return AgentResult(
+        answer=answer,
+        status="failed",
+        tool_calls=calls,
+        trace=[*(trace or []), *retrieval_trace],
+        degraded_without_evidence=True,
+        verification={
+            "passed": False,
+            "mode": "generation_failed",
+            "issues": ["generation_failed"],
+            "citation_count": 0,
+        },
+    )
 
 
 class MedicalAgent:
@@ -61,47 +129,86 @@ class MedicalAgent:
         provider: str,
         tool_context: dict[str, Any] | None = None,
     ) -> AgentResult:
+        model_trace: list[dict[str, Any]] = []
+
+        def finish(result: AgentResult) -> AgentResult:
+            result.trace = [*model_trace, *result.trace]
+            return result
+
         tools = await toolbox.list_tools()
         if not tools:
-            answer = await self.model_runner.generate(
+            answer = await generate_with_retry(
+                self.model_runner,
                 _answer_prompt(question, history, [], no_tools=True),
                 conversation_id=conversation_id,
                 model=model,
                 provider=provider,
+                phase="answer",
+                trace=model_trace,
             )
-            return AgentResult(
-                answer=_with_unverified_notice(answer), degraded_without_evidence=True
-            )
+            return finish(_finalize_answer(answer, [], requires_evidence=True))
 
         observations: list[dict[str, Any]] = []
         calls: list[dict[str, Any]] = []
         tool_index = {tool.name: tool for tool in tools}
 
         for _ in range(self.max_tool_rounds):
-            raw = await self.model_runner.generate(
+            raw = await generate_with_retry(
+                self.model_runner,
                 _decision_prompt(question, history, tools, observations, tool_context),
                 conversation_id=conversation_id,
                 model=model,
                 provider=provider,
+                phase="decision",
+                trace=model_trace,
             )
-            decision = _parse_json_object(raw)
-            if not decision or decision.get("action") == "final":
-                answer = str(decision.get("answer") or raw) if decision else raw
-                if _extract_knowledge_evidence(calls)[0]:
-                    return await self._complete_evidence_answer(
+            if not raw:
+                if not _extract_knowledge_evidence(calls)[0]:
+                    return finish(generation_failure(calls=calls))
+                return finish(
+                    await self._complete_evidence_answer(
                         question=question,
                         history=history,
                         calls=calls,
                         conversation_id=conversation_id,
                         model=model,
                         provider=provider,
+                        model_trace=model_trace,
                     )
-                return _finalize_answer(
-                    answer,
-                    calls,
-                    requires_evidence=bool(
-                        decision.get("requires_evidence", True) if decision else True
-                    ),
+                )
+            decision = _parse_json_object(raw)
+            if not decision or decision.get("action") == "final":
+                answer = str(decision.get("answer") or "").strip() if decision else raw
+                if _extract_knowledge_evidence(calls)[0]:
+                    return finish(
+                        await self._complete_evidence_answer(
+                            question=question,
+                            history=history,
+                            calls=calls,
+                            conversation_id=conversation_id,
+                            model=model,
+                            provider=provider,
+                            model_trace=model_trace,
+                        )
+                    )
+                if not answer:
+                    answer = await generate_with_retry(
+                        self.model_runner,
+                        _answer_prompt(question, history, observations),
+                        conversation_id=conversation_id,
+                        model=model,
+                        provider=provider,
+                        phase="answer",
+                        trace=model_trace,
+                    )
+                return finish(
+                    _finalize_answer(
+                        answer,
+                        calls,
+                        requires_evidence=bool(
+                            decision.get("requires_evidence", True) if decision else True
+                        ),
+                    )
                 )
 
             name = str(decision.get("tool") or "")
@@ -133,21 +240,27 @@ class MedicalAgent:
             observations.append({**record, "result": output.for_model()})
 
         if _extract_knowledge_evidence(calls)[0]:
-            return await self._complete_evidence_answer(
-                question=question,
-                history=history,
-                calls=calls,
-                conversation_id=conversation_id,
-                model=model,
-                provider=provider,
+            return finish(
+                await self._complete_evidence_answer(
+                    question=question,
+                    history=history,
+                    calls=calls,
+                    conversation_id=conversation_id,
+                    model=model,
+                    provider=provider,
+                    model_trace=model_trace,
+                )
             )
-        answer = await self.model_runner.generate(
+        answer = await generate_with_retry(
+            self.model_runner,
             _answer_prompt(question, history, observations),
             conversation_id=conversation_id,
             model=model,
             provider=provider,
+            phase="answer",
+            trace=model_trace,
         )
-        return _finalize_answer(answer, calls, requires_evidence=True)
+        return finish(_finalize_answer(answer, calls, requires_evidence=True))
 
     async def _complete_evidence_answer(
         self,
@@ -158,39 +271,19 @@ class MedicalAgent:
         conversation_id: str,
         model: str,
         provider: str,
+        model_trace: list[dict[str, Any]],
     ) -> AgentResult:
         citations, _ = _extract_knowledge_evidence(calls)
-        answer = await self.model_runner.generate(
+        answer = await generate_with_retry(
+            self.model_runner,
             _evidence_answer_prompt(question, history, citations),
             conversation_id=conversation_id,
             model=model,
             provider=provider,
+            phase="answer",
+            trace=model_trace,
         )
         result = _finalize_answer(answer, calls, requires_evidence=True)
-        if not result.citations:
-            return result
-        try:
-            raw_verification = await self.model_runner.generate(
-                _semantic_verification_prompt(result.answer, result.citations),
-                conversation_id=conversation_id,
-                model=model,
-                provider=provider,
-            )
-            payload = _parse_json_object(raw_verification)
-        except Exception:
-            payload = None
-        semantic = validate_semantic_verification(result.answer, result.citations, payload)
-        issues = sorted(set(result.verification.get("issues", []) + semantic["issues"]))
-        result.verification.update(
-            {
-                "passed": bool(result.verification.get("passed")) and semantic["passed"],
-                "issues": issues,
-                "semantic_passed": semantic["passed"],
-                "claims": semantic["claims"],
-                "supported_claims": semantic["supported_claims"],
-            }
-        )
-        result.degraded_without_evidence = not result.verification["passed"]
         return result
 
 
@@ -255,40 +348,14 @@ def _evidence_answer_prompt(
     ]
     return (
         "你是循证医学问答助手。只能依据给定来源作答；证据不足时明确拒答。\n"
+        "直接回答用户所问，先给结论，再补充最必要的适用条件；通常控制在 1 段或 1-3 个要点。\n"
+        "不要写成检索报告：除非用户明确要求，不要逐条列出来源、盘点检索结果、介绍无关文献，或逐篇说明来源中没有什么。\n"
+        "只提及会影响当前问题结论的重要证据限制；有必要时用一句话说明即可，避免重复总结和冗长通用免责声明。\n"
         "来源数组中的 citation 是后端分配的全局唯一编号，必须严格按该编号引用。\n"
         "每个事实性句子末尾必须添加一个或多个来源编号，如 [1] 或 [1][2]。\n"
         "数字、单位、条件、适用人群不得超出来源；不要编造来源编号；不要输出 JSON。\n"
         f"对话历史：{json.dumps(history, ensure_ascii=False)}\n"
         f"用户问题：{question}\n"
-        f"来源：{json.dumps(sources, ensure_ascii=False, default=str)}"
-    )
-
-
-def _semantic_verification_prompt(
-    answer: str, citations: list[dict[str, Any]]
-) -> str:
-    claims = [
-        {
-            "claim_id": item["claim_id"],
-            "text": item["text"],
-            "citation_ids": item["citation_ids"],
-        }
-        for item in extract_claims(answer)
-        if item["requires_support"] or item["citation_ids"]
-    ]
-    sources = [
-        {"citation_id": index, "text": source.get("text") or ""}
-        for index, source in enumerate(citations, start=1)
-    ]
-    return (
-        "你是严格的医学证据核验器。只输出 JSON 对象，不要输出 Markdown。\n"
-        "逐条判断陈述是否被它标注的来源直接支持，不得使用常识补全。\n"
-        "supported=true 时，evidence 必须至少包含一条来源中的连续逐字原文；"
-        "quote 不得改写，citation_id 必须来自该陈述的 citation_ids。\n"
-        "输出格式："
-        '{"claims":[{"claim_id":1,"supported":true,'
-        '"evidence":[{"citation_id":1,"quote":"逐字原文"}],"reason":""}]}\n'
-        f"陈述：{json.dumps(claims, ensure_ascii=False)}\n"
         f"来源：{json.dumps(sources, ensure_ascii=False, default=str)}"
     )
 
@@ -316,10 +383,14 @@ def _finalize_answer(
     *,
     requires_evidence: bool,
 ) -> AgentResult:
+    if not answer.strip():
+        return generation_failure(calls=calls)
     citations, trace = _extract_knowledge_evidence(calls)
     if citations:
         answer = normalize_citations(answer)
         answer, citations = compact_citations(answer, citations)
+        if not answer.strip():
+            return generation_failure(calls=calls)
         verification = verify_answer(answer, citations)
         degraded = not verification["passed"]
         return AgentResult(

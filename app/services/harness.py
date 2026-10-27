@@ -14,6 +14,10 @@ MEDICAL_SYSTEM_PROMPT = """你是循证医学问答助手。
 优先依据工具返回的材料回答，不得编造文献、指南、数据或引用。
 当工具没有返回有效证据时，必须明确说明回答未经文献验证。
 涉及诊断或治疗时应提醒用户结合患者具体情况并由专业医生判断。
+回答应直接回应用户的问题，先给结论，再给理解该结论所必需的条件或依据；默认简洁，避免把检索过程写成报告。
+不要逐条罗列检索到的文献，不要描述无关资料，也不要逐篇说明某来源“没有提到什么”；用户明确要求来源比较、证据盘点或检索过程时除外。
+仅保留与问题直接相关且会改变结论的证据、限定条件和不确定性。无需为了显得全面而重复同一结论、扩展背景或添加多段通用免责声明。
+若证据存在重要限制，用一句简短说明即可；不要把检索到的所有来源和证据缺口都展开叙述。
 工具决策阶段必须严格遵守用户消息中给出的 JSON 输出协议。
 """
 
@@ -76,6 +80,10 @@ class HarnessService:
             request_timeout_seconds=self.settings.request_timeout_seconds,
         ) as harness:
             result = harness.run(prompt, session_id=f"turn-{uuid.uuid4().hex}")
+        if not result.final_response.strip():
+            raise RuntimeError(
+                f"Harness returned an empty response (finish_reason={result.finish_reason})"
+            )
         return result.final_response
 
     @staticmethod

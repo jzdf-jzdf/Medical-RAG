@@ -24,6 +24,8 @@ services:
       WORKSPACE_ROOT: /data
       QDRANT_URL: http://qdrant:6333
       TASK_WORKER_ENABLED: "false"
+      DEEPSEEK_API_KEY: ${DEEPSEEK_API_KEY:-}
+      DEEPSEEK_BASE_URL: ${DEEPSEEK_BASE_URL:-https://api.deepseek.com}
       RERANKER_MODEL: ${RERANKER_MODEL:-}
       MEDCPT_CACHE_DIR: /data/models/medcpt
     volumes:
@@ -52,6 +54,8 @@ services:
       QDRANT_URL: http://qdrant:6333
       RERANKER_MODEL: ${RERANKER_MODEL:-}
       TASK_WORKER_ENABLED: "true"
+      DEEPSEEK_API_KEY: ${DEEPSEEK_API_KEY:-}
+      DEEPSEEK_BASE_URL: ${DEEPSEEK_BASE_URL:-https://api.deepseek.com}
       MEDCPT_CACHE_DIR: /data/models/medcpt
     volumes:
       - knowledge-files:/data

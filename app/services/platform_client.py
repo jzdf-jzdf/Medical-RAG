@@ -81,6 +81,7 @@ class PlatformClient:
         content: str,
         title: str,
         model_config_id: str | None = None,
+        collection_id: str | None = None,
         execution_mode: str = "agent",
     ) -> dict[str, Any]:
         conversation = await self._request(
@@ -99,6 +100,8 @@ class PlatformClient:
         }
         if model_config_id:
             payload["model_config_id"] = model_config_id
+        if collection_id:
+            payload["collection_id"] = collection_id
         attempts = 2 if execution_mode == "direct" else 1
         for attempt in range(attempts):
             result = await self._request(

@@ -20,4 +20,6 @@ uvicorn app.main:app --reload --port 8003
 - `POST /question-banks/{id}/questions`：向题库手工加入问答题或单选题。
 - `POST /question-banks/{id}/questions/bulk`：批量保存生成题目。
 - `POST /questions/generate`：选择最多 8 个分块并生成问答题或单选题。
+- `POST /test-runs`：选择已有题库，逐题调用 Agent 测试并持久化评分结果。
+- `GET /test-runs`、`GET /test-runs/{id}`：查看最近测试记录和逐题回答。
 

@@ -1,0 +1,16 @@
+.env
+.venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.ruff_cache/
+.runtime/
+.acl-recovery/
+node_modules/
+dist/
+artifacts/
+runtime/
+test-results/
+.idea/
+.vscode/
+

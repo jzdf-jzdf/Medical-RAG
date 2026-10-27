@@ -1,4 +1,11 @@
 const API_BASE = import.meta.env.VITE_AGENT_API_BASE || '/api/agent'
+const KNOWLEDGE_API_BASE = import.meta.env.VITE_KNOWLEDGE_API_BASE || '/api/knowledge'
+
+export interface KnowledgeBaseOption {
+  id: string
+  name: string
+  status: string
+}
 
 export interface ConversationSummary {
   id: string
@@ -59,6 +66,7 @@ export interface SemanticClaim {
   claim_id: number
   text: string
   citation_ids: number[]
+  verified: boolean
   supported: boolean
   evidence: Array<{ citation_id: number; quote: string }>
   reason?: string
@@ -68,6 +76,7 @@ export interface ChatResult {
   run_id: string
   message_id: string
   content: string
+  status?: 'completed' | 'failed'
   citations: Citation[]
   degraded_without_evidence: boolean
   model: string
@@ -150,6 +159,7 @@ export function sendChat(
   userId: string,
   content: string,
   modelConfigId?: string,
+  collectionId?: string,
 ) {
   return request<ChatResult>('/api/v1/chat', {
     method: 'POST',
@@ -159,8 +169,16 @@ export function sendChat(
       user_id: userId,
       content,
       model_config_id: modelConfigId || null,
+      collection_id: collectionId || null,
     }),
   })
+}
+
+export async function listKnowledgeBases() {
+  const response = await fetch(`${KNOWLEDGE_API_BASE}/api/v1/knowledge-bases`)
+  if (!response.ok) throw new Error('读取知识库列表失败')
+  const items = await response.json() as KnowledgeBaseOption[]
+  return items.filter((item) => item.status === 'indexed')
 }
 
 export function listModels() {

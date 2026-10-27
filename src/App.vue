@@ -1,5 +1,8 @@
 <script setup lang="ts">
 import { computed, nextTick, onMounted, ref } from 'vue'
+import DOMPurify from 'dompurify'
+import { parseAnswerMarkdown } from './markdown'
+import AccountMenu from './components/AccountMenu.vue'
 
 import {
   createModel,
@@ -7,7 +10,7 @@ import {
   deleteConversation,
   deleteModel,
   getConversation,
-  getHealth,
+  listKnowledgeBases,
   listConversations,
   listModels,
   sendChat,
@@ -15,6 +18,7 @@ import {
   type ChatResult,
   type Citation,
   type ConversationSummary,
+  type KnowledgeBaseOption,
   type ModelConfig,
   type ModelConfigInput,
   type SemanticClaim,
@@ -50,7 +54,6 @@ const prompt = ref('')
 const loading = ref(false)
 const loadingConversation = ref(false)
 const deletingConversationId = ref<string | null>(null)
-const online = ref(false)
 const error = ref('')
 const sidebarOpen = ref(false)
 const inspectorOpen = ref(false)
@@ -58,6 +61,9 @@ const modelSettingsOpen = ref(false)
 const selectedResult = ref<ChatResult | null>(null)
 const messageList = ref<HTMLElement | null>(null)
 const models = ref<ModelConfig[]>([])
+const knowledgeBases = ref<KnowledgeBaseOption[]>([])
+const selectedKnowledgeBaseId = ref(localStorage.getItem('medical-agent-knowledge-base-id') || '')
+const knowledgeBaseError = ref('')
 const selectedModelId = ref(localStorage.getItem('medical-agent-model-id') || '')
 const editingModelId = ref<string | null>(null)
 const modelFormOpen = ref(false)
@@ -107,16 +113,8 @@ const activeModel = computed(() =>
 const activeModelLabel = computed(() => activeModel.value?.name || '环境默认模型')
 
 onMounted(async () => {
-  await Promise.all([refreshHealth(), loadConversations(), loadModels()])
+  await Promise.all([loadConversations(), loadModels(), loadKnowledgeBases()])
 })
-
-async function refreshHealth() {
-  try {
-    online.value = (await getHealth()).status === 'ok'
-  } catch {
-    online.value = false
-  }
-}
 
 async function loadConversations() {
   try {
@@ -140,6 +138,23 @@ async function loadModels() {
   } catch (cause) {
     showError(cause)
   }
+}
+
+async function loadKnowledgeBases() {
+  try {
+    knowledgeBases.value = await listKnowledgeBases()
+    if (!knowledgeBases.value.some((item) => item.id === selectedKnowledgeBaseId.value)) {
+      chooseKnowledgeBase('')
+    }
+  } catch {
+    knowledgeBaseError.value = '知识库列表暂不可用，将使用服务端默认设置。'
+    chooseKnowledgeBase('')
+  }
+}
+
+function chooseKnowledgeBase(id: string) {
+  selectedKnowledgeBaseId.value = id
+  localStorage.setItem('medical-agent-knowledge-base-id', id)
 }
 
 async function selectConversation(id: string) {
@@ -231,11 +246,12 @@ async function submit() {
       userId,
       content,
       selectedModelId.value || undefined,
+      selectedKnowledgeBaseId.value || undefined,
     )
     messages.value.push({
       id: result.message_id,
       role: 'assistant',
-      content: result.content,
+      content: result.content.trim() || '本次未生成有效回答，请重新发送问题。',
       createdAt: new Date().toISOString(),
       result,
     })
@@ -244,7 +260,13 @@ async function submit() {
     const current = conversations.value.find((item) => item.id === conversationId)
     if (current) current.updated_at = new Date().toISOString()
   } catch (cause) {
-    messages.value = messages.value.filter((message) => message.id !== optimisticId)
+    const detail = cause instanceof Error ? cause.message : '连接服务失败'
+    messages.value.push({
+      id: `local-error-${Date.now()}`,
+      role: 'assistant',
+      content: `本次请求未能完成：${detail}。请稍后重新发送问题。`,
+      createdAt: new Date().toISOString(),
+    })
     prompt.value = content
     showError(cause)
   } finally {
@@ -353,6 +375,45 @@ function displayedMessageContent(content: string) {
     .trim()
 }
 
+function renderMarkdown(content: string) {
+  const source = (displayedMessageContent(content) || '本次未生成有效回答，请重新发送问题。')
+    .replace(/\\([*_])/g, '$1')
+    .replace(/^\s*\*\*(#{1,6}\s+)/gm, '$1')
+    .replace(/^(#{1,6}\s+.+?) {2,}(?=\*\*)/gm, '$1\n\n')
+    .replace(/ {2,}(?=(?:[-*+]\s|\d+[.)、]\s))/g, '\n')
+  const html = DOMPurify.sanitize(parseAnswerMarkdown(source))
+  return renderCitationSuperscripts(html)
+}
+
+function renderCitationSuperscripts(html: string) {
+  const template = document.createElement('template')
+  template.innerHTML = html
+  const walker = document.createTreeWalker(template.content, NodeFilter.SHOW_TEXT)
+  const textNodes: Text[] = []
+  while (walker.nextNode()) textNodes.push(walker.currentNode as Text)
+
+  textNodes.forEach((node) => {
+    if (node.parentElement?.closest('a, code, pre, sup')) return
+    const value = node.textContent ?? ''
+    const pattern = /\[(\d+)\]/g
+    const fragment = document.createDocumentFragment()
+    let cursor = 0
+    let match: RegExpExecArray | null
+    while ((match = pattern.exec(value))) {
+      fragment.append(document.createTextNode(value.slice(cursor, match.index)))
+      const marker = document.createElement('sup')
+      marker.className = 'citation-marker'
+      marker.textContent = match[0]
+      fragment.append(marker)
+      cursor = match.index + match[0].length
+    }
+    if (cursor === 0) return
+    fragment.append(document.createTextNode(value.slice(cursor)))
+    node.replaceWith(fragment)
+  })
+  return template.innerHTML
+}
+
 function hasVerificationFailure(result: ChatResult) {
   return result.citations.length > 0 && result.verification?.passed === false
 }
@@ -364,7 +425,8 @@ function verificationIssueText(result: ChatResult) {
     uncited_claim: '存在未标注来源的陈述',
     invalid_source: '引用编号无效',
     semantic_mismatch: '陈述与引用原文不完全对应',
-    semantic_verification_failed: '语义核验未完成',
+    semantic_verification_failed: '语义核验暂不可用',
+    generation_failed: '回答生成失败，请重试',
   }
   return (result.verification?.issues ?? []).map((item) => labels[item] || item).join('·')
 }
@@ -416,6 +478,8 @@ function highlightedSegments(text: string, citationId: number): TextSegment[] {
 }
 
 function runStatus(result: ChatResult) {
+  if (result.status === 'failed') return '回答生成失败'
+  if (result.verification?.issues?.includes('semantic_verification_failed')) return '核验暂不可用'
   if (hasVerificationFailure(result)) return '引用核验未通过'
   if (result.degraded_without_evidence) return '证据不足'
   return '已完成'
@@ -476,12 +540,7 @@ function showError(cause: unknown) {
 }
 
 function getUserId() {
-  const key = 'medical-agent-user-id'
-  const existing = localStorage.getItem(key)
-  if (existing) return existing
-  const created = `web-${crypto.randomUUID()}`
-  localStorage.setItem(key, created)
-  return created
+  return 'web-shared'
 }
 
 async function scrollToBottom() {
@@ -547,10 +606,7 @@ async function scrollToBottom() {
         </div>
       </nav>
 
-      <footer class="sidebar-footer">
-        <span class="status-dot" :class="{ online }" />
-        <div><strong>{{ online ? 'Agent 服务在线' : 'Agent 服务离线' }}</strong><small>所有医学结论需经临床复核</small></div>
-      </footer>
+      <AccountMenu />
     </aside>
 
     <main class="workspace">
@@ -604,12 +660,15 @@ async function scrollToBottom() {
               <span>{{ message.role === 'user' ? '你的问题' : '循证回答' }}</span>
               <time>{{ formatTime(message.createdAt) }}</time>
             </div>
-            <p>{{ displayedMessageContent(message.content) }}</p>
+            <div v-if="message.role === 'assistant'" class="markdown-body" v-html="renderMarkdown(message.content)" />
+            <p v-else>{{ displayedMessageContent(message.content) }}</p>
             <div v-if="message.result" class="answer-meta">
               <div class="answer-status">
-                <span v-if="hasVerificationFailure(message.result)" class="warning-chip">引用核验未通过</span>
+                <span v-if="message.result.status === 'failed'" class="warning-chip">回答生成失败</span>
+                <span v-else-if="message.result.verification?.issues?.includes('semantic_verification_failed')" class="warning-chip">核验暂不可用</span>
+                <span v-else-if="hasVerificationFailure(message.result)" class="warning-chip">引用核验未通过</span>
                 <span v-else-if="message.result.degraded_without_evidence" class="warning-chip">证据不足</span>
-                <span v-else-if="message.result.verification.semantic_passed" class="verified-chip">语义核验通过</span>
+                <span v-else-if="message.result.citations.length" class="verified-chip">来源与数字已检查</span>
                 <span v-else-if="message.result.citations.length" class="verified-chip">引用已核验</span>
                 <span v-else class="neutral-chip">无需检索</span>
                 <small v-if="hasVerificationFailure(message.result)">{{ verificationIssueText(message.result) }}</small>
@@ -634,6 +693,20 @@ async function scrollToBottom() {
         <p v-if="error" class="error-banner" role="alert">
           <span>{{ error }}</span><button type="button" @click="error = ''">关闭</button>
         </p>
+        <div class="composer-context">
+          <label for="knowledge-base-select">本轮知识库</label>
+          <select
+            id="knowledge-base-select"
+            :value="selectedKnowledgeBaseId"
+            :disabled="loading"
+            @change="chooseKnowledgeBase(($event.target as HTMLSelectElement).value)"
+          >
+            <option value="">服务端默认</option>
+            <option v-for="item in knowledgeBases" :key="item.id" :value="item.id">{{ item.name }}</option>
+          </select>
+          <span v-if="knowledgeBaseError" class="knowledge-base-hint" role="status">{{ knowledgeBaseError }}</span>
+          <span v-else-if="!knowledgeBases.length" class="knowledge-base-hint">没有已索引的知识库</span>
+        </div>
         <form class="composer" @submit.prevent="submit">
           <textarea
             v-model="prompt"
@@ -665,7 +738,7 @@ async function scrollToBottom() {
           <div><dt>模型</dt><dd>{{ selectedResult.model }}</dd></div>
           <div><dt>检索返回</dt><dd>{{ retrievedChunks.length }}</dd></div>
           <div><dt>证据引用</dt><dd>{{ evidenceCount }}</dd></div>
-          <div><dt>陈述支持</dt><dd>{{ selectedResult.verification.supported_claims ?? '—' }}/{{ semanticClaims(selectedResult).length || '—' }}</dd></div>
+          <div><dt>基础校验</dt><dd>{{ selectedResult.verification.passed ? '通过' : '需复核' }}</dd></div>
           <div><dt>工具调用</dt><dd>{{ toolCalls.length }}</dd></div>
         </dl>
 
@@ -722,7 +795,7 @@ async function scrollToBottom() {
               <div v-if="claimsForCitation(index + 1).length" class="claim-links">
                 <span>对应陈述</span>
                 <div v-for="claim in claimsForCitation(index + 1)" :key="claim.claim_id">
-                  <b :class="{ failed: !claim.supported }">{{ claim.supported ? '已支持' : '未通过' }}</b>
+                  <b :class="{ failed: claim.verified && !claim.supported, pending: !claim.verified }">{{ !claim.verified ? '待核验' : claim.supported ? '已支持' : '未通过' }}</b>
                   <p>{{ claim.text }}</p>
                   <small v-if="!claim.supported && claim.reason">{{ claim.reason }}</small>
                 </div>

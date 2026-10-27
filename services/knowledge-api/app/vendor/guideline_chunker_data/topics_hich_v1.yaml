@@ -1,0 +1,248 @@
+taxonomy_version: hich_topics_v1
+topics:
+- id: T01
+  name: 定义、病因与危险因素
+  children:
+  - id: T01.01
+    name: 疾病定义与范围
+  - id: T01.02
+    name: 病因与病因分类
+  - id: T01.03
+    name: 高血压相关病理机制
+  - id: T01.04
+    name: 血压相关危险因素
+  - id: T01.05
+    name: 其他危险因素
+  - id: T01.06
+    name: 流行病学特征
+- id: T02
+  name: 临床表现与急诊评估
+  children:
+  - id: T02.01
+    name: 发病方式与病史采集
+  - id: T02.02
+    name: 神经系统症状与体征
+  - id: T02.03
+    name: 意识状态与神经功能评估
+  - id: T02.04
+    name: 生命体征与全身状况评估
+  - id: T02.05
+    name: 实验室与基础辅助检查
+  - id: T02.06
+    name: 严重程度量表
+  - id: T02.07
+    name: 急诊分诊与初始评估流程
+- id: T03
+  name: 影像学诊断与血肿评估
+  children:
+  - id: T03.01
+    name: 头颅CT检查
+  - id: T03.02
+    name: MRI检查
+  - id: T03.03
+    name: 血管影像与病因筛查
+  - id: T03.04
+    name: 血肿部位与形态
+  - id: T03.05
+    name: 血肿体积测量
+  - id: T03.06
+    name: 脑室出血与脑积水
+  - id: T03.07
+    name: 占位效应与周围组织改变
+  - id: T03.08
+    name: 复查影像与动态监测
+- id: T04
+  name: 血肿扩大及其预测
+  children:
+  - id: T04.01
+    name: 血肿扩大定义与判定标准
+  - id: T04.02
+    name: 发生时间与自然演变
+  - id: T04.03
+    name: 临床预测因素
+  - id: T04.04
+    name: 影像学预测征象
+  - id: T04.05
+    name: 血压与血肿扩大
+  - id: T04.06
+    name: 凝血状态与血肿扩大
+  - id: T04.07
+    name: 血肿扩大与临床结局
+- id: T05
+  name: 急性期血压管理
+  children:
+  - id: T05.01
+    name: 血压评估与动态监测
+  - id: T05.02
+    name: 降压启动条件与时机
+  - id: T05.03
+    name: 收缩压目标
+  - id: T05.04
+    name: 降压速度与幅度
+  - id: T05.05
+    name: 降压持续时间与血压稳定性
+  - id: T05.06
+    name: 降压安全性与获益
+  - id: T05.07
+    name: 个体化血压管理
+- id: T06
+  name: 降压药物选择
+  children:
+  - id: T06.01
+    name: 降压药物选择原则
+  - id: T06.02
+    name: 静脉降压药物
+  - id: T06.03
+    name: 给药方式与剂量调整
+  - id: T06.04
+    name: 联合用药与替代方案
+  - id: T06.05
+    name: 药物禁忌证与个体化选择
+  - id: T06.06
+    name: 不良反应与用药监测
+- id: T07
+  name: 脑灌注、颅内高压与脑疝
+  children:
+  - id: T07.01
+    name: 颅内压风险评估与监测
+  - id: T07.02
+    name: 脑灌注压管理
+  - id: T07.03
+    name: 颅内高压时的血压管理
+  - id: T07.04
+    name: 基础降颅压措施
+  - id: T07.05
+    name: 渗透性治疗
+  - id: T07.06
+    name: 脑室引流与脑积水处理
+  - id: T07.07
+    name: 脑疝与库欣反应
+- id: T08
+  name: 止血及凝血功能管理
+  children:
+  - id: T08.01
+    name: 凝血状态评估
+  - id: T08.02
+    name: 维生素K拮抗剂逆转
+  - id: T08.03
+    name: 直接口服抗凝药逆转
+  - id: T08.04
+    name: 肝素类药物逆转
+  - id: T08.05
+    name: 溶栓相关脑出血处理
+  - id: T08.06
+    name: 抗血小板治疗相关脑出血
+  - id: T08.07
+    name: 非特异性止血治疗
+- id: T09
+  name: 一般支持与内科管理
+  children:
+  - id: T09.01
+    name: 监护级别与一般生命支持
+  - id: T09.02
+    name: 气道、氧合与通气管理
+  - id: T09.03
+    name: 液体、电解质与肾功能管理
+  - id: T09.04
+    name: 血糖管理
+  - id: T09.05
+    name: 体温管理
+  - id: T09.06
+    name: 吞咽、营养与误吸预防
+  - id: T09.07
+    name: 消化道及其他基础支持
+- id: T10
+  name: 外科治疗
+  children:
+  - id: T10.01
+    name: 手术适应证与患者选择
+  - id: T10.02
+    name: 手术时机
+  - id: T10.03
+    name: 开颅血肿清除术
+  - id: T10.04
+    name: 微创穿刺与导管治疗
+  - id: T10.05
+    name: 神经内镜手术
+  - id: T10.06
+    name: 去骨瓣减压术
+  - id: T10.07
+    name: 脑室出血与脑室外引流
+  - id: T10.08
+    name: 小脑出血手术
+  - id: T10.09
+    name: 深部及脑干出血手术
+- id: T11
+  name: 围手术期管理
+  children:
+  - id: T11.01
+    name: 术前评估与准备
+  - id: T11.02
+    name: 围手术期血压管理
+  - id: T11.03
+    name: 麻醉管理
+  - id: T11.04
+    name: 术中循环与脑灌注管理
+  - id: T11.05
+    name: 围手术期止血与凝血管理
+  - id: T11.06
+    name: 术后监护与影像复查
+  - id: T11.07
+    name: 引流管理与术后早期问题
+- id: T12
+  name: 并发症防治
+  children:
+  - id: T12.01
+    name: 癫痫与痫性发作
+  - id: T12.02
+    name: 静脉血栓栓塞
+  - id: T12.03
+    name: 肺部感染与误吸性肺炎
+  - id: T12.04
+    name: 泌尿系统感染
+  - id: T12.05
+    name: 心脏并发症
+  - id: T12.06
+    name: 消化道出血
+  - id: T12.07
+    name: 制动与护理相关并发症
+- id: T13
+  name: 康复与预后评估
+  children:
+  - id: T13.01
+    name: 康复评估与启动时机
+  - id: T13.02
+    name: 运动与平衡功能康复
+  - id: T13.03
+    name: 言语与交流功能康复
+  - id: T13.04
+    name: 吞咽功能康复
+  - id: T13.05
+    name: 认知功能康复
+  - id: T13.06
+    name: 情绪与心理问题
+  - id: T13.07
+    name: 日常生活与社会功能
+  - id: T13.08
+    name: 预后因素与结局评估
+- id: T14
+  name: 长期管理与复发预防
+  children:
+  - id: T14.01
+    name: 复发风险评估
+  - id: T14.02
+    name: 长期血压目标
+  - id: T14.03
+    name: 长期降压药物治疗
+  - id: T14.04
+    name: 家庭血压监测与随访
+  - id: T14.05
+    name: 用药依从性与患者教育
+  - id: T14.06
+    name: 生活方式干预
+  - id: T14.07
+    name: 抗血小板治疗重启
+  - id: T14.08
+    name: 抗凝治疗重启
+  - id: T14.09
+    name: 综合血管危险因素管理

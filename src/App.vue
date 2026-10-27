@@ -3,6 +3,10 @@ import DOMPurify from 'dompurify'
 import { marked } from 'marked'
 import { computed, nextTick, onBeforeUnmount, onMounted, reactive, ref } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
+import ChunkSemanticMetadata from './components/ChunkSemanticMetadata.vue'
+import ChunkRunArtifacts from './components/ChunkRunArtifacts.vue'
+import ChunkingMethodDetails from './components/ChunkingMethodDetails.vue'
+import AccountMenu from './components/AccountMenu.vue'
 
 type Tab = 'welcome' | 'documents' | 'configurations' | 'knowledge' | 'tasks'
 type NavigationTab = Exclude<Tab, 'welcome'>
@@ -48,6 +52,13 @@ interface ApiDocument {
     created_at: string
   }>
   created_at: string
+}
+
+interface DocumentDeletionSummary {
+  total_count: number
+  protected_count: number
+  processing_count: number
+  deletable_count: number
 }
 
 interface ChunkingMethod {
@@ -97,6 +108,16 @@ interface ChunkPreviewItem {
   char_end: number
   char_count: number
   heading_path: string[]
+  metadata?: Record<string, unknown>
+}
+
+interface ChunkPreviewResponse {
+  chunks: ChunkPreviewItem[]
+  stats: ChunkPreviewStats
+  document_title?: string
+  run_id?: string
+  run_metadata?: Record<string, unknown>
+  processing_report?: { quality_gate_passed: boolean }
 }
 
 interface ChunkPreviewStats {
@@ -147,6 +168,7 @@ interface ProcessingTask {
   error_message?: string
   attempt_count: number
   max_attempts: number
+  has_chunking_result?: boolean
   created_at: string
   started_at?: string
   finished_at?: string
@@ -159,6 +181,7 @@ interface KnowledgeSearchHit {
   document_title: string
   content: string
   heading_path: string[]
+  metadata?: Record<string, unknown>
   score: number
   citation: { title: string; heading?: string; pages?: Array<number | null> }
 }
@@ -186,7 +209,6 @@ const activeTab = computed<Tab>(() => {
 })
 // Navigation and service reachability are independent: routes remain usable so
 // an offline API can show explicit recovery states instead of a blank screen.
-const serviceState = ref<'checking' | 'online' | 'offline'>('checking')
 const tabs: Array<{ id: NavigationTab; label: string; path: string }> = [
   { id: 'documents', label: '文献管理', path: tabPaths.documents },
   { id: 'configurations', label: '模型注册', path: tabPaths.configurations },
@@ -201,6 +223,9 @@ const selectedEntryId = ref<string | null>(null)
 const expandedEntryIds = ref<Set<string>>(new Set())
 const isEntriesLoading = ref(true)
 const entriesLoadError = ref('')
+const documentDeletionSummary = ref<DocumentDeletionSummary | null>(null)
+const isLoadingDeletionSummary = ref(false)
+const isBulkDeletingDocuments = ref(false)
 const searchQuery = ref('')
 const itemFilter = ref('all')
 const isCreateDialogOpen = ref(false)
@@ -225,6 +250,7 @@ const isDeletingEntry = ref(false)
 const titleInput = ref<HTMLInputElement | null>(null)
 const notice = ref<{ kind: NoticeKind; message: string } | null>(null)
 const chunkingMethods = ref<ChunkingMethod[]>([])
+const selectedChunkingMethod = ref<ChunkingMethod | null>(null)
 const embeddingModels = ref<EmbeddingModel[]>([])
 const knowledgeBases = ref<KnowledgeBase[]>([])
 const isConfigurationsLoading = ref(true)
@@ -254,6 +280,12 @@ const chunkingPreviewStats = ref<ChunkPreviewStats | null>(null)
 const chunkingPreviewError = ref('')
 const isChunkingPreviewLoading = ref(false)
 const chunkingPreviewSignature = ref('')
+const chunkingProgressMessage = ref('')
+const knowledgeChunkProgressMessage = ref('')
+const guidelineEngine = ref<{ api_key_configured: boolean; model: string; topic_count: number } | null>(null)
+const guidelineTaskResult = ref<ChunkPreviewResponse | null>(null)
+let recipePreviewController: AbortController | null = null
+let knowledgePreviewController: AbortController | null = null
 const isEmbeddingDialogOpen = ref(false)
 const isKnowledgeDialogOpen = ref(false)
 const isSavingKnowledgeBase = ref(false)
@@ -264,6 +296,7 @@ const isChunkPreviewLoading = ref(false)
 const chunkPreviewError = ref('')
 const downloadingModelId = ref<string | null>(null)
 const buildingKnowledgeBaseId = ref<string | null>(null)
+const deletingKnowledgeBaseId = ref<string | null>(null)
 const knowledgeSearchQuery = ref('')
 const knowledgeSearchResults = ref<KnowledgeSearchHit[]>([])
 const knowledgeSearchError = ref('')
@@ -293,6 +326,20 @@ const chunkingForm = reactive({
   prependHeadingPath: true,
   preserveTables: true,
   preserveCodeBlocks: true,
+  batchTargetChars: 2600,
+  batchMaxChars: 4200,
+  batchTargetAtoms: 12,
+  batchMaxAtoms: 18,
+  contextBefore: 2,
+  contextAfter: 2,
+  reviewMaxChars: 500,
+  summaryEnabled: true,
+  summaryMaxChars: 300,
+  semanticTimeout: 180,
+  semanticAttempts: 3,
+  semanticConcurrency: 1,
+  cacheEnabled: true,
+  requireQualityGate: true,
 })
 
 const embeddingForm = reactive({
@@ -402,7 +449,17 @@ function mapKnowledgeBase(item: ApiKnowledgeBase): KnowledgeBase {
 }
 
 function strategyLabel(strategy: string): string {
-  return ({ heading: '标题层级', recursive: '递归字符', fixed: '固定长度' } as Record<string, string>)[strategy] || strategy
+  return ({ heading: '标题层级', recursive: '递归字符', fixed: '固定长度', guideline_semantic: '指南原子知识（DeepSeek）' } as Record<string, string>)[strategy] || strategy
+}
+
+function methodSize(method: ChunkingMethod): string | number {
+  const batching = method.config.batching as { max_chars?: number } | undefined
+  return method.strategy === 'guideline_semantic' ? batching?.max_chars || 4200 : method.config.max_chars as number || '—'
+}
+
+function methodContext(method: ChunkingMethod): string | number {
+  const batching = method.config.batching as { context_before_atoms?: number; context_after_atoms?: number } | undefined
+  return method.strategy === 'guideline_semantic' ? `${batching?.context_before_atoms ?? 2} / ${batching?.context_after_atoms ?? 2} 原子` : method.config.overlap as number || 0
 }
 
 function providerLabel(provider: string): string {
@@ -551,6 +608,19 @@ async function loadEntries(preferredId?: string | null): Promise<void> {
   }
 }
 
+async function loadDocumentDeletionSummary(): Promise<void> {
+  isLoadingDeletionSummary.value = true
+  try {
+    const response = await fetch(`${apiBase}/api/v1/documents/deletion-summary`)
+    if (!response.ok) throw new Error(await responseError(response))
+    documentDeletionSummary.value = await response.json() as DocumentDeletionSummary
+  } catch {
+    documentDeletionSummary.value = null
+  } finally {
+    isLoadingDeletionSummary.value = false
+  }
+}
+
 async function loadConfigurations(): Promise<void> {
   isConfigurationsLoading.value = true
   configurationsLoadError.value = ''
@@ -563,6 +633,8 @@ async function loadConfigurations(): Promise<void> {
     if (!embeddingResponse.ok) throw new Error(await responseError(embeddingResponse))
     chunkingMethods.value = await chunkingResponse.json() as ChunkingMethod[]
     embeddingModels.value = await embeddingResponse.json() as EmbeddingModel[]
+    const engineResponse = await fetch(`${apiBase}/api/v1/configurations/guideline-chunker`)
+    if (engineResponse.ok) guidelineEngine.value = await engineResponse.json()
   } catch (error) {
     chunkingMethods.value = []
     embeddingModels.value = []
@@ -744,21 +816,12 @@ async function refreshRealData(): Promise<void> {
   // Individual loaders own their own error states and never inject demo data.
   await Promise.all([
     loadEntries(selectedEntryId.value),
+    loadDocumentDeletionSummary(),
     loadConfigurations(),
     loadKnowledgeBases(),
     loadDashboard(),
     loadTasks(),
-    checkService(),
   ])
-}
-
-async function checkService(): Promise<void> {
-  try {
-    const response = await fetch(`${apiBase}/health`)
-    serviceState.value = response.ok ? 'online' : 'offline'
-  } catch {
-    serviceState.value = 'offline'
-  }
 }
 
 function openCreateDialog(): void {
@@ -1091,7 +1154,7 @@ async function deleteSelectedEntry(): Promise<void> {
   try {
     const response = await fetch(`${apiBase}/api/v1/documents/${selectedEntry.value.id}`, { method: 'DELETE' })
     if (!response.ok) throw new Error(await responseError(response))
-    await Promise.all([loadEntries(null), loadDashboard(), loadTasks()])
+    await Promise.all([loadEntries(null), loadDashboard(), loadTasks(), loadDocumentDeletionSummary()])
     showNotice('success', '条目及其附件已删除')
   } catch (error) {
     showNotice('error', error instanceof Error ? error.message : '条目删除失败')
@@ -1100,8 +1163,42 @@ async function deleteSelectedEntry(): Promise<void> {
   }
 }
 
+async function deleteUnprotectedDocuments(): Promise<void> {
+  const count = documentDeletionSummary.value?.deletable_count ?? 0
+  if (!count || isBulkDeletingDocuments.value) return
+  const processingCount = documentDeletionSummary.value?.processing_count ?? 0
+  const warning = processingCount
+    ? `另有 ${processingCount} 条正在处理的文献会暂时保留。`
+    : ''
+  if (!window.confirm(`确定清空 ${count} 条未加入知识库且未在处理中的文献吗？这些条目的附件也会删除。已加入知识库的文献不会删除。${warning}`)) return
+  isBulkDeletingDocuments.value = true
+  try {
+    const response = await fetch(`${apiBase}/api/v1/documents/delete-unprotected`, { method: 'POST' })
+    if (!response.ok) throw new Error(await responseError(response))
+    const result = await response.json() as { deleted_count: number; protected_count: number; processing_count: number }
+    await Promise.all([loadEntries(null), loadDashboard(), loadTasks(), loadDocumentDeletionSummary()])
+    const skipped = result.processing_count ? `，${result.processing_count} 条正在处理的文献保留` : ''
+    showNotice('success', `已删除 ${result.deleted_count} 条文献及其附件；${result.protected_count} 条知识库文献已保留${skipped}`)
+  } catch (error) {
+    showNotice('error', error instanceof Error ? error.message : '一键清理文献失败')
+    await loadDocumentDeletionSummary()
+  } finally {
+    isBulkDeletingDocuments.value = false
+  }
+}
+
 function chunkingConfigPayload(): Record<string, unknown> {
   // Preview and registration must send exactly the same persisted recipe.
+  if (chunkingForm.strategy === 'guideline_semantic') return {
+    deepseek: { model: 'deepseek-v4-flash', timeout_seconds: chunkingForm.semanticTimeout, max_attempts: chunkingForm.semanticAttempts, concurrent_requests: chunkingForm.semanticConcurrency },
+    batching: { target_chars: chunkingForm.batchTargetChars, max_chars: chunkingForm.batchMaxChars, target_atoms: chunkingForm.batchTargetAtoms, max_atoms: chunkingForm.batchMaxAtoms, context_before_atoms: chunkingForm.contextBefore, context_after_atoms: chunkingForm.contextAfter },
+    chunking: { review_max_chars: chunkingForm.reviewMaxChars },
+    summary: { enabled: chunkingForm.summaryEnabled, max_chars: chunkingForm.summaryMaxChars },
+    cache_enabled: chunkingForm.cacheEnabled,
+    require_quality_gate: chunkingForm.requireQualityGate,
+    prepend_heading_path: chunkingForm.prependHeadingPath,
+    max_chunks: chunkingForm.maxChunks,
+  }
   return {
     target_chars: chunkingForm.targetChars,
     max_chars: chunkingForm.maxChars,
@@ -1126,6 +1223,8 @@ function currentChunkingPreviewSignature(): string {
 }
 
 function openChunkingDialog(): void {
+  recipePreviewController?.abort()
+  isChunkingPreviewLoading.value = false
   chunkingStep.value = 1
   chunkingPreviewDocumentId.value = markdownReadyEntries.value[0]?.id || ''
   chunkingPreview.value = []
@@ -1147,7 +1246,12 @@ function goToChunkingStep(step: number): void {
     showNotice('error', '请先填写分块方法名称')
     return
   }
-  if (step > 2) {
+  if (step > 2 && chunkingForm.strategy === 'guideline_semantic') {
+    if (chunkingForm.batchTargetChars > chunkingForm.batchMaxChars || chunkingForm.batchTargetAtoms > chunkingForm.batchMaxAtoms) {
+      showNotice('error', '语义批次目标不能超过对应的最大值')
+      return
+    }
+  } else if (step > 2) {
     if (chunkingForm.minChars > chunkingForm.targetChars || chunkingForm.targetChars > chunkingForm.maxChars) {
       showNotice('error', '字符范围需要满足：最小字符 ≤ 目标字符 ≤ 最大字符')
       return
@@ -1170,12 +1274,18 @@ async function previewChunkingMethod(): Promise<void> {
     return
   }
   isChunkingPreviewLoading.value = true
+  chunkingProgressMessage.value = ''
   chunkingPreviewError.value = ''
   chunkingPreview.value = []
   chunkingPreviewStats.value = null
+  recipePreviewController?.abort()
+  const controller = new AbortController()
+  recipePreviewController = controller
+  const signature = currentChunkingPreviewSignature()
   try {
     const response = await fetch(`${apiBase}/api/v1/configurations/chunking-methods/preview`, {
       method: 'POST',
+      signal: controller.signal,
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({
         document_id: chunkingPreviewDocumentId.value,
@@ -1184,14 +1294,44 @@ async function previewChunkingMethod(): Promise<void> {
       }),
     })
     if (!response.ok) throw new Error(await responseError(response))
-    const result = await response.json() as { chunks: ChunkPreviewItem[]; stats: ChunkPreviewStats }
+    const result = await readChunkingResponse(response, controller.signal, (message) => { chunkingProgressMessage.value = message })
     chunkingPreview.value = result.chunks
     chunkingPreviewStats.value = result.stats
-    chunkingPreviewSignature.value = currentChunkingPreviewSignature()
+    chunkingPreviewSignature.value = signature
   } catch (error) {
+    if (controller.signal.aborted) return
     chunkingPreviewError.value = error instanceof Error ? error.message : '分块预览生成失败'
   } finally {
-    isChunkingPreviewLoading.value = false
+    if (recipePreviewController === controller) isChunkingPreviewLoading.value = false
+  }
+}
+
+async function readChunkingResponse(response: Response, signal: AbortSignal, update: (message: string) => void): Promise<ChunkPreviewResponse> {
+  if (!response.ok) throw new Error(await responseError(response))
+  if (response.status !== 202) return await response.json() as ChunkPreviewResponse
+  let task = await response.json() as ProcessingTask
+  tasks.value = [task, ...tasks.value.filter((item) => item.id !== task.id)]
+  scheduleTaskPolling()
+  while (['queued', 'running'].includes(task.status)) {
+    update(task.message || '指南语义切块任务正在后台执行，可在解析任务页查看进度')
+    await new Promise((resolve) => window.setTimeout(resolve, 1500))
+    const statusResponse = await fetch(`${apiBase}/api/v1/processing-tasks/${task.id}`, { signal })
+    if (!statusResponse.ok) throw new Error(await responseError(statusResponse))
+    task = await statusResponse.json() as ProcessingTask
+  }
+  if (task.status !== 'completed') throw new Error(task.error_message || '指南语义切块未完成，请在解析任务页重试')
+  const resultResponse = await fetch(`${apiBase}/api/v1/processing-tasks/${task.id}/result`, { signal })
+  if (!resultResponse.ok) throw new Error(await responseError(resultResponse))
+  return await resultResponse.json() as ChunkPreviewResponse
+}
+
+async function viewGuidelineTaskResult(task: ProcessingTask): Promise<void> {
+  try {
+    const response = await fetch(`${apiBase}/api/v1/processing-tasks/${task.id}/result`)
+    if (!response.ok) throw new Error(await responseError(response))
+    guidelineTaskResult.value = await response.json() as ChunkPreviewResponse
+  } catch (error) {
+    showNotice('error', error instanceof Error ? error.message : '切块结果加载失败')
   }
 }
 
@@ -1284,7 +1424,10 @@ async function downloadEmbeddingModel(model: EmbeddingModel): Promise<void> {
 }
 
 function closeChunkingDialog(): void {
-  if (!isSavingChunkingMethod.value) isChunkingDialogOpen.value = false
+  if (!isSavingChunkingMethod.value) {
+    isChunkingDialogOpen.value = false
+    recipePreviewController?.abort()
+  }
 }
 
 function closeEmbeddingDialog(): void {
@@ -1361,6 +1504,37 @@ async function createKnowledgeBase(): Promise<void> {
   }
 }
 
+function knowledgeBaseIsBusy(library: KnowledgeBase): boolean {
+  return library.status === 'building'
+    || buildingKnowledgeBaseId.value === library.id
+    || activeTasks.value.some((task) => (
+      task.resource_type === 'knowledge_base' && task.resource_id === library.id
+    ))
+}
+
+async function deleteKnowledgeBase(library: KnowledgeBase): Promise<void> {
+  if (knowledgeBaseIsBusy(library)) {
+    showNotice('info', '知识库正在构建，完成后才能删除')
+    return
+  }
+  if (deletingKnowledgeBaseId.value) return
+  const wasSelected = selectedKnowledgeBase.value?.id === library.id
+  const documentCount = library.documents.length
+  if (!window.confirm(`确定删除知识库“${library.name}”吗？该知识库的向量索引和分块数据会删除；其中 ${documentCount} 篇文献及其附件会保留。`)) return
+  deletingKnowledgeBaseId.value = library.id
+  try {
+    const response = await fetch(`${apiBase}/api/v1/knowledge-bases/${library.id}`, { method: 'DELETE' })
+    if (!response.ok) throw new Error(await responseError(response))
+    await Promise.all([loadKnowledgeBases(), loadDashboard(), loadTasks()])
+    if (wasSelected) closeKnowledgeBase()
+    showNotice('success', `知识库“${library.name}”已删除，文献及附件已保留`)
+  } catch (error) {
+    showNotice('error', error instanceof Error ? error.message : '知识库删除失败')
+  } finally {
+    deletingKnowledgeBaseId.value = null
+  }
+}
+
 function openKnowledgeBase(item: KnowledgeBase): void {
   selectedKnowledgeBase.value = item
   selectedKnowledgeDocument.value = null
@@ -1372,6 +1546,7 @@ function openKnowledgeBase(item: KnowledgeBase): void {
 }
 
 function closeKnowledgeBase(): void {
+  knowledgePreviewController?.abort()
   selectedKnowledgeBase.value = null
   selectedKnowledgeDocument.value = null
   chunkPreview.value = []
@@ -1424,15 +1599,20 @@ async function openKnowledgeDocument(document: LibraryEntry): Promise<void> {
   chunkPreview.value = []
   chunkPreviewError.value = ''
   isChunkPreviewLoading.value = true
+  knowledgeChunkProgressMessage.value = ''
+  knowledgePreviewController?.abort()
+  const controller = new AbortController()
+  knowledgePreviewController = controller
   try {
-    const response = await fetch(`${apiBase}/api/v1/knowledge-bases/${selectedKnowledgeBase.value.id}/documents/${document.id}/chunks`)
+    const response = await fetch(`${apiBase}/api/v1/knowledge-bases/${selectedKnowledgeBase.value.id}/documents/${document.id}/chunks`, { signal: controller.signal })
     if (!response.ok) throw new Error(await responseError(response))
-    const result = await response.json() as { chunks: ChunkPreviewItem[] }
+    const result = await readChunkingResponse(response, controller.signal, (message) => { knowledgeChunkProgressMessage.value = message })
     chunkPreview.value = result.chunks
   } catch (error) {
+    if (controller.signal.aborted) return
     chunkPreviewError.value = error instanceof Error ? error.message : '分块预览加载失败'
   } finally {
-    isChunkPreviewLoading.value = false
+    if (knowledgePreviewController === controller) isChunkPreviewLoading.value = false
   }
 }
 
@@ -1447,6 +1627,8 @@ onBeforeUnmount(() => {
   // Prevent a detached page from continuing network requests after navigation
   // or hot-module replacement during development.
   stopTaskPolling()
+  recipePreviewController?.abort()
+  knowledgePreviewController?.abort()
   document.removeEventListener('visibilitychange', scheduleTaskPolling)
 })
 </script>
@@ -1473,7 +1655,7 @@ onBeforeUnmount(() => {
           <span>{{ tab.label }}</span>
         </RouterLink>
       </nav>
-      <div class="aside-foot"><i :class="serviceState"></i>知识服务 {{ serviceState === 'online' ? '在线' : serviceState === 'offline' ? '未连接' : '检测中' }}</div>
+      <AccountMenu />
     </aside>
 
     <main>
@@ -1500,6 +1682,7 @@ onBeforeUnmount(() => {
         <header class="page-header document-header">
           <div><p class="eyebrow">Reference library</p><h1>文献管理</h1><p>以条目组织元数据，以附件保留可追溯的原始文件。</p></div>
           <div class="header-actions">
+            <button class="cleanup-button" type="button" :disabled="isBulkDeletingDocuments || isLoadingDeletionSummary || !documentDeletionSummary?.deletable_count" :title="documentDeletionSummary ? `共 ${documentDeletionSummary.total_count} 条，${documentDeletionSummary.protected_count} 条在知识库中受保护，${documentDeletionSummary.processing_count} 条正在处理` : '正在读取可清理文献数量'" @click="deleteUnprotectedDocuments">{{ isBulkDeletingDocuments ? '正在清空…' : `清空文献（${documentDeletionSummary?.deletable_count ?? '…'}）` }}</button>
             <button class="soft-button" type="button" :disabled="isUploading" @click="openUploadDialog('new')"><svg aria-hidden="true" viewBox="0 0 24 24"><path d="M12 5v14M5 12h14"/><path d="M4 19.5V21h16v-1.5"/></svg>添加文件</button>
             <button type="button" @click="openCreateDialog"><svg aria-hidden="true" viewBox="0 0 24 24"><path d="M6 3h9l3 3v15H6z"/><path d="M9 12h6M12 9v6"/></svg>新建条目</button>
           </div>
@@ -1553,7 +1736,7 @@ onBeforeUnmount(() => {
           <article class="registry-section">
             <div class="registry-heading"><div><span class="registry-icon chunk-icon"><svg aria-hidden="true" viewBox="0 0 24 24"><path d="M5 4h14v5H5zM5 15h6v5H5zM15 15h4v5h-4z"/></svg></span><div><p class="eyebrow">Chunking methods</p><h2>分块方法</h2></div></div><span>{{ chunkingMethods.length }} 个</span></div>
             <div v-if="chunkingMethods.length" class="registry-list">
-              <article v-for="method in chunkingMethods" :key="method.id" class="registry-row chunking-row"><div class="registry-row-main"><span class="method-swatch" :style="{ background: method.color }"></span><div><strong>{{ method.name }}</strong><p>{{ method.description || '暂无说明' }}</p></div></div><div class="registry-row-value"><small>策略</small><span>{{ strategyLabel(method.strategy) }}</span></div><div class="registry-row-value"><small>最大字符</small><span>{{ method.config.max_chars || '—' }}</span></div><div class="registry-row-value"><small>重叠字符</small><span>{{ method.config.overlap || 0 }}</span></div><button class="danger-link" type="button" :disabled="deletingConfigurationId === method.id" @click="deleteConfiguration('chunking-methods', method.id, method.name)">{{ deletingConfigurationId === method.id ? '删除中…' : '删除' }}</button></article>
+              <article v-for="method in chunkingMethods" :key="method.id" class="registry-row chunking-row"><div class="registry-row-main"><span class="method-swatch" :style="{ background: method.color }"></span><button class="method-detail-trigger" type="button" :aria-label="`查看分块方法 ${method.name} 的详情`" title="点击查看完整配置" @click="selectedChunkingMethod = method"><strong>{{ method.name }}</strong><span class="method-detail-preview">{{ method.description || '暂无说明' }}</span></button></div><div class="registry-row-value"><small>策略</small><span>{{ strategyLabel(method.strategy) }}</span></div><div class="registry-row-value"><small>{{ method.strategy === 'guideline_semantic' ? '批次上限' : '最大字符' }}</small><span>{{ methodSize(method) }}</span></div><div class="registry-row-value"><small>{{ method.strategy === 'guideline_semantic' ? '前后上下文' : '重叠字符' }}</small><span>{{ methodContext(method) }}</span></div><button class="danger-link" type="button" :disabled="deletingConfigurationId === method.id" @click="deleteConfiguration('chunking-methods', method.id, method.name)">{{ deletingConfigurationId === method.id ? '删除中…' : '删除' }}</button></article>
             </div>
             <div v-else class="registry-empty">还没有分块方法，请先注册一个。</div>
           </article>
@@ -1574,15 +1757,15 @@ onBeforeUnmount(() => {
         <template v-else-if="!selectedKnowledgeBase">
           <header class="page-header"><div><p class="eyebrow">Knowledge collections</p><h1>知识库管理</h1><p>只选择已经具有 MD 文本版本的文献，并绑定分块方法和嵌入模型。</p></div><button type="button" :disabled="!markdownReadyEntries.length || !chunkingMethods.length || !embeddingModels.length" @click="openKnowledgeDialog">＋ 新建知识库</button></header>
           <div v-if="!chunkingMethods.length || !embeddingModels.length" class="configuration-callout"><div><strong>还需要完成构建配置</strong><p>新建知识库前，至少注册一个分块方法和一个嵌入模型。</p></div><button class="soft-button" type="button" @click="navigateTo('configurations')">前往方法与模型</button></div>
-          <section v-if="knowledgeBases.length" class="library-grid"><article v-for="library in knowledgeBases" :key="library.id" class="library-card" :style="{ '--method-color': library.chunkingMethod.color }"><span class="library-orb"></span><div class="library-card-top"><span>{{ library.status === 'configured' ? '已配置' : library.status }}</span><small>{{ library.documents.length }} 篇文献</small></div><h2>{{ library.name }}</h2><p>{{ library.description || '暂无知识库说明。' }}</p><dl><div><dt>分块</dt><dd><i :style="{ background: library.chunkingMethod.color }"></i>{{ library.chunkingMethod.name }}</dd></div><div><dt>嵌入</dt><dd>{{ library.embeddingModel.name }}</dd></div></dl><button class="text-action" type="button" @click="openKnowledgeBase(library)">打开知识库 →</button></article></section>
+          <section v-if="knowledgeBases.length" class="library-grid"><article v-for="library in knowledgeBases" :key="library.id" class="library-card" :style="{ '--method-color': library.chunkingMethod.color }"><span class="library-orb"></span><div class="library-card-top"><span>{{ library.status === 'configured' ? '已配置' : library.status }}</span><small>{{ library.documents.length }} 篇文献</small></div><h2>{{ library.name }}</h2><p>{{ library.description || '暂无知识库说明。' }}</p><dl><div><dt>分块</dt><dd><i :style="{ background: library.chunkingMethod.color }"></i>{{ library.chunkingMethod.name }}</dd></div><div><dt>嵌入</dt><dd>{{ library.embeddingModel.name }}</dd></div></dl><div class="library-card-actions"><button class="text-action" type="button" @click="openKnowledgeBase(library)">打开知识库 →</button><button class="danger-link" type="button" :disabled="knowledgeBaseIsBusy(library) || deletingKnowledgeBaseId !== null" :title="knowledgeBaseIsBusy(library) ? '构建完成后才能删除' : '删除知识库及其向量索引，保留文献与附件'" @click="deleteKnowledgeBase(library)">{{ deletingKnowledgeBaseId === library.id ? '删除中…' : knowledgeBaseIsBusy(library) ? '构建中' : '删除知识库' }}</button></div></article></section>
           <section v-else class="knowledge-empty"><span class="registry-icon chunk-icon"><svg aria-hidden="true" viewBox="0 0 24 24"><path d="M4 5h7v14H4zM13 5h7v6h-7zM13 13h7v6h-7z"/></svg></span><h2>还没有知识库</h2><p>先准备 MD 文本，再选择分块方法和嵌入模型创建知识库。</p><button type="button" :disabled="!markdownReadyEntries.length || !chunkingMethods.length || !embeddingModels.length" @click="openKnowledgeDialog">新建知识库</button></section>
         </template>
 
         <template v-else>
           <button class="back-link" type="button" @click="closeKnowledgeBase">← 返回知识库列表</button>
-          <header class="page-header knowledge-detail-header"><div><p class="eyebrow">Knowledge base</p><h1>{{ selectedKnowledgeBase.name }}</h1><p>{{ selectedKnowledgeBase.description || '暂无知识库说明。' }}</p></div><div class="knowledge-header-actions"><div class="knowledge-config-summary"><span><i :style="{ background: selectedKnowledgeBase.chunkingMethod.color }"></i>{{ selectedKnowledgeBase.chunkingMethod.name }}</span><span>{{ selectedKnowledgeBase.embeddingModel.name }}</span><span>{{ taskStatusLabel(selectedKnowledgeBase.status) }}</span></div><div class="knowledge-build-actions"><button type="button" :disabled="buildingKnowledgeBaseId === selectedKnowledgeBase.id || selectedKnowledgeBase.status === 'building'" @click="buildKnowledgeBase">{{ selectedKnowledgeBase.status === 'indexed' ? '重建向量索引' : selectedKnowledgeBase.status === 'building' ? '向量构建中…' : '构建向量索引' }}</button></div></div></header>
+          <header class="page-header knowledge-detail-header"><div><p class="eyebrow">Knowledge base</p><h1>{{ selectedKnowledgeBase.name }}</h1><p>{{ selectedKnowledgeBase.description || '暂无知识库说明。' }}</p></div><div class="knowledge-header-actions"><div class="knowledge-config-summary"><span><i :style="{ background: selectedKnowledgeBase.chunkingMethod.color }"></i>{{ selectedKnowledgeBase.chunkingMethod.name }}</span><span>{{ selectedKnowledgeBase.embeddingModel.name }}</span><span>{{ taskStatusLabel(selectedKnowledgeBase.status) }}</span></div><div class="knowledge-build-actions"><button type="button" :disabled="buildingKnowledgeBaseId === selectedKnowledgeBase.id || knowledgeBaseIsBusy(selectedKnowledgeBase)" @click="buildKnowledgeBase">{{ selectedKnowledgeBase.status === 'indexed' ? '重建向量索引' : knowledgeBaseIsBusy(selectedKnowledgeBase) ? '向量构建中…' : '构建向量索引' }}</button><button class="danger-link knowledge-delete-action" type="button" :disabled="knowledgeBaseIsBusy(selectedKnowledgeBase) || deletingKnowledgeBaseId !== null" @click="deleteKnowledgeBase(selectedKnowledgeBase)">{{ deletingKnowledgeBaseId === selectedKnowledgeBase.id ? '正在删除…' : '删除知识库' }}</button></div></div></header>
           <form class="knowledge-search" role="search" @submit.prevent="searchKnowledgeBase"><label><span>MedCPT 语义检索</span><input v-model="knowledgeSearchQuery" type="search" placeholder="输入医学问题或检索词" :disabled="selectedKnowledgeBase.status !== 'indexed'" /></label><button type="submit" :disabled="selectedKnowledgeBase.status !== 'indexed' || isKnowledgeSearching || !knowledgeSearchQuery.trim()">{{ isKnowledgeSearching ? '检索中…' : '检索知识块' }}</button></form>
-          <section v-if="knowledgeSearchError || knowledgeSearchResults.length" class="knowledge-search-results" aria-live="polite"><p v-if="knowledgeSearchError" class="search-error" role="alert">{{ knowledgeSearchError }}</p><article v-for="hit in knowledgeSearchResults" :key="hit.chunk_id"><header><strong>{{ hit.document_title }}</strong><span>{{ Math.round(hit.score * 100) }}%</span></header><small>{{ hit.heading_path.join(' › ') || '正文' }}</small><p>{{ hit.content }}</p></article></section>
+          <section v-if="knowledgeSearchError || knowledgeSearchResults.length" class="knowledge-search-results" aria-live="polite"><p v-if="knowledgeSearchError" class="search-error" role="alert">{{ knowledgeSearchError }}</p><article v-for="hit in knowledgeSearchResults" :key="hit.chunk_id"><header><strong>{{ hit.document_title }}</strong><span>{{ Math.round(hit.score * 100) }}%</span></header><small>{{ hit.heading_path.join(' › ') || '正文' }}</small><ChunkSemanticMetadata :metadata="hit.metadata" /><p>{{ hit.content }}</p></article></section>
           <section class="knowledge-workspace">
             <section class="knowledge-documents" aria-label="知识库文献">
               <div class="pane-heading"><div><p class="eyebrow">Included references</p><h2>加入的文献</h2></div><span>{{ selectedKnowledgeBase.documents.length }} 篇</span></div>
@@ -1591,9 +1774,9 @@ onBeforeUnmount(() => {
             <section class="chunk-viewer" aria-label="文献分块预览">
               <template v-if="selectedKnowledgeDocument">
                 <div class="chunk-viewer-heading"><div><p class="eyebrow">Chunk preview</p><h2>{{ selectedKnowledgeDocument.title }}</h2></div><span><i :style="{ background: selectedKnowledgeBase.chunkingMethod.color }"></i>{{ strategyLabel(selectedKnowledgeBase.chunkingMethod.strategy) }}</span></div>
-                <div v-if="isChunkPreviewLoading" class="preview-state" role="status"><span class="loading-ring"></span><p>正在按所选方法生成分块预览…</p></div>
+                <div v-if="isChunkPreviewLoading" class="preview-state" role="status"><span class="loading-ring"></span><p>{{ knowledgeChunkProgressMessage || '正在按所选方法生成分块预览…' }}</p></div>
                 <div v-else-if="chunkPreviewError" class="preview-state error" role="alert"><p>{{ chunkPreviewError }}</p><button type="button" @click="openKnowledgeDocument(selectedKnowledgeDocument)">重新加载</button></div>
-                <div v-else-if="chunkPreview.length" class="chunk-list"><article v-for="chunk in chunkPreview" :key="chunk.index" class="chunk-block" :style="{ '--chunk-color': selectedKnowledgeBase.chunkingMethod.color }"><span>Chunk {{ String(chunk.index).padStart(2, '0') }}</span><div class="chunk-markdown" v-html="renderMarkdownHtml(chunk.content)"></div><small>字符 {{ chunk.char_start }}–{{ chunk.char_end }}</small></article></div>
+                <template v-else-if="chunkPreview.length"><ChunkRunArtifacts :metadata="chunkPreview[0]?.metadata" /><div class="chunk-list"><article v-for="chunk in chunkPreview" :key="chunk.index" class="chunk-block" :style="{ '--chunk-color': selectedKnowledgeBase.chunkingMethod.color }"><span>Chunk {{ String(chunk.index).padStart(2, '0') }}</span><ChunkSemanticMetadata :metadata="chunk.metadata" /><div class="chunk-markdown" v-html="renderMarkdownHtml(chunk.content)"></div><small>字符 {{ chunk.char_start }}–{{ chunk.char_end }}</small></article></div></template>
                 <div v-else class="preview-state"><p>当前文献没有可用于分块预览的文本。</p></div>
               </template>
               <div v-else class="preview-state"><span class="registry-icon chunk-icon"><svg aria-hidden="true" viewBox="0 0 24 24"><path d="M5 4h14v5H5zM5 15h6v5H5zM15 15h4v5h-4z"/></svg></span><p>选择左侧文献，查看带颜色标识的分块结果。</p></div>
@@ -1608,11 +1791,25 @@ onBeforeUnmount(() => {
           <div class="section-title"><div><p class="eyebrow">Persisted jobs</p><h2>真实处理记录</h2></div><div class="task-bulk-actions"><label v-if="removableTasks.length"><input type="checkbox" :checked="allRemovableTasksSelected" @change="toggleAllRemovableTasks" />全选可移除</label><button class="task-bulk-delete" type="button" :disabled="!selectedTaskIds.size || deletingTaskIds.size > 0" @click="deleteSelectedTasks">{{ deletingTaskIds.size ? '处理中…' : `移除所选（${selectedTaskIds.size}）` }}</button><span class="count">{{ tasks.length }} 条记录</span></div></div>
           <div v-if="isTasksLoading" class="data-state" role="status"><span class="loading-ring"></span><p>正在读取处理记录…</p></div>
           <div v-else-if="tasksLoadError" class="data-state error" role="alert"><p>{{ tasksLoadError }}</p><button type="button" @click="loadTasks()">重新加载</button></div>
-          <div v-else-if="tasks.length" class="task-list" aria-live="polite" aria-atomic="false"><article v-for="task in tasks" :key="task.id"><label v-if="isRemovableTask(task)" class="task-select"><input type="checkbox" :checked="selectedTaskIds.has(task.id)" :disabled="deletingTaskIds.has(task.id)" @change="toggleTaskSelection(task.id)" /><span class="visually-hidden">选择 {{ task.name }}</span></label><span v-else class="task-select-spacer" aria-hidden="true"></span><div class="task-copy"><h3>{{ task.name }}</h3><p>{{ task.operation }} · {{ task.processor }} · {{ formatDateTime(task.created_at) }}</p><small v-if="task.error_message" class="task-error" role="alert">{{ task.error_message }}</small><small v-else>{{ task.message || '处理记录已持久化' }}</small></div><div class="progress" :class="{ indeterminate: task.progress === null && ['queued', 'running', 'building'].includes(task.status) }" :aria-label="task.progress === null ? `${taskStatusLabel(task.status)}，进度暂不可确定` : `处理进度 ${task.progress}%`"><i :style="task.progress === null ? undefined : { width: `${task.progress}%` }"></i></div><b>{{ task.progress === null ? '处理中' : `${task.progress}%` }}</b><span class="tag" :class="`task-${task.status}`">{{ taskStatusLabel(task.status) }}</span><div class="task-row-actions"><button v-if="task.status === 'failed' && task.attempt_count < task.max_attempts" class="task-retry" type="button" :disabled="deletingTaskIds.has(task.id)" @click="retryTask(task)">重试</button><button v-if="isRemovableTask(task)" class="task-delete" type="button" :disabled="deletingTaskIds.has(task.id)" @click="deleteTask(task)">{{ deletingTaskIds.has(task.id) ? '处理中…' : task.id.startsWith('document-version:') ? '隐藏' : '删除' }}</button></div></article></div>
+          <div v-else-if="tasks.length" class="task-list" aria-live="polite" aria-atomic="false"><article v-for="task in tasks" :key="task.id"><label v-if="isRemovableTask(task)" class="task-select"><input type="checkbox" :checked="selectedTaskIds.has(task.id)" :disabled="deletingTaskIds.has(task.id)" @change="toggleTaskSelection(task.id)" /><span class="visually-hidden">选择 {{ task.name }}</span></label><span v-else class="task-select-spacer" aria-hidden="true"></span><div class="task-copy"><h3>{{ task.name }}</h3><p>{{ task.operation }} · {{ task.processor }} · {{ formatDateTime(task.created_at) }}</p><small v-if="task.error_message" class="task-error" role="alert">{{ task.error_message }}</small><small v-else>{{ task.message || '处理记录已持久化' }}</small></div><div class="progress" :class="{ indeterminate: task.progress === null && ['queued', 'running', 'building'].includes(task.status) }" :aria-label="task.progress === null ? `${taskStatusLabel(task.status)}，进度暂不可确定` : `处理进度 ${task.progress}%`"><i :style="task.progress === null ? undefined : { width: `${task.progress}%` }"></i></div><b>{{ task.progress === null ? '处理中' : `${task.progress}%` }}</b><span class="tag" :class="`task-${task.status}`">{{ taskStatusLabel(task.status) }}</span><div class="task-row-actions"><button v-if="task.has_chunking_result" class="text-action" type="button" @click="viewGuidelineTaskResult(task)">查看切块结果</button><button v-if="task.status === 'failed' && task.attempt_count < task.max_attempts" class="task-retry" type="button" :disabled="deletingTaskIds.has(task.id)" @click="retryTask(task)">重试</button><button v-if="isRemovableTask(task)" class="task-delete" type="button" :disabled="deletingTaskIds.has(task.id)" @click="deleteTask(task)">{{ deletingTaskIds.has(task.id) ? '处理中…' : task.id.startsWith('document-version:') ? '隐藏' : '删除' }}</button></div></article></div>
           <div v-else class="data-state"><p>暂无已持久化的处理记录。上传 MD、执行 MinerU 转换或创建知识库后会显示在这里。</p></div>
         </section>
       </template>
     </main>
+
+    <Teleport to="body">
+      <ChunkingMethodDetails v-if="selectedChunkingMethod" :method="selectedChunkingMethod" :engine-label="strategyLabel(selectedChunkingMethod.strategy)" @close="selectedChunkingMethod = null" />
+    </Teleport>
+
+    <Teleport to="body">
+      <div v-if="guidelineTaskResult" class="dialog-backdrop" @click.self="guidelineTaskResult = null" @keydown.esc="guidelineTaskResult = null">
+        <section class="entry-dialog guideline-result-dialog" role="dialog" aria-modal="true" aria-labelledby="guideline-result-title">
+          <div class="dialog-heading"><div><p class="eyebrow">Guideline Chunker</p><h2 id="guideline-result-title">{{ guidelineTaskResult.document_title || '指南切块结果' }}</h2><p>{{ guidelineTaskResult.chunks.length }} 个原子知识块</p></div><button class="icon-button" type="button" aria-label="关闭指南切块结果" @click="guidelineTaskResult = null">×</button></div>
+          <ChunkRunArtifacts :metadata="guidelineTaskResult.chunks[0]?.metadata || guidelineTaskResult.run_metadata" />
+          <div class="recipe-preview-list"><article v-for="chunk in guidelineTaskResult.chunks" :key="chunk.index"><header><span>Chunk {{ chunk.index }}</span><small>字符 {{ chunk.char_start }}–{{ chunk.char_end }}</small></header><p v-if="chunk.heading_path.length" class="chunk-breadcrumb">{{ chunk.heading_path.join(' › ') }}</p><ChunkSemanticMetadata :metadata="chunk.metadata" /><div class="chunk-markdown compact" v-html="renderMarkdownHtml(chunk.content)"></div></article></div>
+        </section>
+      </div>
+    </Teleport>
 
     <Teleport to="body">
       <div v-if="isChunkingDialogOpen" class="dialog-backdrop" @click.self="closeChunkingDialog" @keydown.esc="closeChunkingDialog">
@@ -1629,12 +1826,36 @@ onBeforeUnmount(() => {
                 <button type="button" :class="{ selected: chunkingForm.strategy === 'heading' }" @click="chunkingForm.strategy = 'heading'"><span class="engine-icon">H</span><span><strong>Markdown 标题</strong><small>按 H1–H6 章节组织，过长章节再递归切分；适合结构化指南。</small></span><i>{{ chunkingForm.strategy === 'heading' ? '已选择' : '推荐' }}</i></button>
                 <button type="button" :class="{ selected: chunkingForm.strategy === 'recursive' }" @click="chunkingForm.strategy = 'recursive'"><span class="engine-icon">¶</span><span><strong>递归边界</strong><small>优先在段落、句号和换行处切开；适合标题不规范的正文。</small></span><i>{{ chunkingForm.strategy === 'recursive' ? '已选择' : '通用' }}</i></button>
                 <button type="button" :class="{ selected: chunkingForm.strategy === 'fixed' }" @click="chunkingForm.strategy = 'fixed'"><span class="engine-icon">≡</span><span><strong>固定长度</strong><small>按字符窗口稳定切分并保留重叠；适合基准测试和可复现实验。</small></span><i>{{ chunkingForm.strategy === 'fixed' ? '已选择' : '基准' }}</i></button>
+                <button type="button" :class="{ selected: chunkingForm.strategy === 'guideline_semantic' }" @click="chunkingForm.strategy = 'guideline_semantic'"><span class="engine-icon">G</span><span><strong>医学指南原子知识</strong><small>规则原子化 + DeepSeek 语义判断，输出 FACT / REC、主题标签、推荐等级和切块质量报告。</small></span><i>{{ chunkingForm.strategy === 'guideline_semantic' ? '已选择' : 'Guideline Chunker' }}</i></button>
               </div></fieldset>
               <label class="full-field"><span>使用说明</span><textarea v-model.trim="chunkingForm.description" rows="3" placeholder="记录适用文献、预期效果或版本说明"></textarea></label>
             </section>
 
             <section v-else-if="chunkingStep === 2" class="configuration-stage">
               <div class="stage-heading"><div><p class="eyebrow">Rules</p><h3>控制块大小与上下文连续性</h3></div><span>{{ strategyLabel(chunkingForm.strategy) }}</span></div>
+              <template v-if="chunkingForm.strategy === 'guideline_semantic'">
+                <div class="engine-explainer"><strong>模型：deepseek-v4-flash · {{ guidelineEngine?.topic_count || 102 }} 个受控主题</strong><p>{{ guidelineEngine?.api_key_configured ? 'DeepSeek 已配置。语义切块在后台运行，可从解析任务页查看进度与结果。' : 'DeepSeek 尚未配置。请在知识服务及 Worker 的后端环境中设置 DEEPSEEK_API_KEY。' }}</p></div>
+                <div class="parameter-grid">
+                  <label><span>批次目标字符</span><input v-model.number="chunkingForm.batchTargetChars" type="number" min="1" required /><small>决定每次语义判断的正文范围，不是单块长度。</small></label>
+                  <label><span>批次最大字符</span><input v-model.number="chunkingForm.batchMaxChars" type="number" min="1" required /></label>
+                  <label><span>批次目标原子数</span><input v-model.number="chunkingForm.batchTargetAtoms" type="number" min="1" required /></label>
+                  <label><span>批次最大原子数</span><input v-model.number="chunkingForm.batchMaxAtoms" type="number" min="1" required /></label>
+                  <label><span>前文上下文原子数</span><input v-model.number="chunkingForm.contextBefore" type="number" min="0" max="2" required /></label>
+                  <label><span>后文上下文原子数</span><input v-model.number="chunkingForm.contextAfter" type="number" min="0" max="2" required /></label>
+                  <label><span>待核查区间最大字符</span><input v-model.number="chunkingForm.reviewMaxChars" type="number" min="1" required /></label>
+                  <label><span>摘要最大字符</span><input v-model.number="chunkingForm.summaryMaxChars" type="number" min="1" required /></label>
+                  <label><span>单次请求超时（秒）</span><input v-model.number="chunkingForm.semanticTimeout" type="number" min="1" required /></label>
+                  <label><span>单批次最多尝试次数</span><input v-model.number="chunkingForm.semanticAttempts" type="number" min="1" max="3" required /></label>
+                  <label><span>文献最多知识块数</span><input v-model.number="chunkingForm.maxChunks" type="number" min="1" max="10000" required /></label>
+                </div>
+                <div class="rule-switches">
+                  <label><input v-model="chunkingForm.summaryEnabled" type="checkbox" /><span><strong>生成知识摘要</strong><small>摘要须通过原文忠实度校验。</small></span></label>
+                  <label><input v-model="chunkingForm.cacheEnabled" type="checkbox" /><span><strong>复用语义缓存</strong><small>重试或重新构建时复用相同原文和参数的已验证结果。</small></span></label>
+                  <label><input v-model="chunkingForm.requireQualityGate" type="checkbox" /><span><strong>发布索引前必须通过质量门</strong><small>覆盖率不足、存在未解决切块问题时阻止索引发布。</small></span></label>
+                  <label><input v-model="chunkingForm.prependHeadingPath" type="checkbox" /><span><strong>嵌入文本携带标题路径</strong><small>知识块正文保持原文连续切片。</small></span></label>
+                </div>
+              </template>
+              <template v-else>
               <div class="parameter-grid">
                 <label><span>目标字符数</span><input v-model.number="chunkingForm.targetChars" type="number" min="100" max="10000" required /><small>引擎优先生成的块大小。</small></label>
                 <label><span>最大字符数</span><input v-model.number="chunkingForm.maxChars" type="number" min="100" max="20000" required /><small>单个块不可超过的硬上限。</small></label>
@@ -1649,17 +1870,19 @@ onBeforeUnmount(() => {
                 <label><input v-model="chunkingForm.preserveTables" type="checkbox" /><span><strong>尽量保持表格完整</strong><small>避免在 Markdown 表格行中间切断。</small></span></label>
                 <label><input v-model="chunkingForm.preserveCodeBlocks" type="checkbox" /><span><strong>尽量保持代码块完整</strong><small>避免在围栏代码块中间切断。</small></span></label>
               </div>
+              </template>
             </section>
 
             <section v-else class="configuration-stage preview-stage">
               <div class="stage-heading"><div><p class="eyebrow">Dry run</p><h3>使用真实 MD 检查分块结果</h3></div><span>注册前必做</span></div>
               <div v-if="markdownReadyEntries.length" class="preview-controls"><label><span>样本文献</span><select v-model="chunkingPreviewDocumentId"><option v-for="entry in markdownReadyEntries" :key="entry.id" :value="entry.id">{{ entry.title }}</option></select></label><button type="button" :disabled="isChunkingPreviewLoading" @click="previewChunkingMethod">{{ isChunkingPreviewLoading ? '生成中…' : chunkingPreview.length ? '重新生成预览' : '生成预览' }}</button></div>
               <div v-else class="preview-empty"><strong>还没有可用的 Markdown 文献</strong><p>请先在文献管理上传 MD，或用 MinerU 将 PDF 转为 MD。</p></div>
-              <div v-if="isChunkingPreviewLoading" class="preview-state compact" role="status"><span class="loading-ring"></span><p>正在执行 {{ strategyLabel(chunkingForm.strategy) }}…</p></div>
+              <div v-if="isChunkingPreviewLoading" class="preview-state compact" role="status"><span class="loading-ring"></span><p>{{ chunkingProgressMessage || `正在执行 ${strategyLabel(chunkingForm.strategy)}…` }}</p></div>
               <div v-else-if="chunkingPreviewError" class="preview-state compact error" role="alert"><p>{{ chunkingPreviewError }}</p></div>
               <template v-else-if="chunkingPreviewStats">
                 <dl class="preview-stat-grid"><div><dt>分块总数</dt><dd>{{ chunkingPreviewStats.total }}</dd></div><div><dt>平均长度</dt><dd>{{ chunkingPreviewStats.average_chars }}</dd></div><div><dt>最短 / 最长</dt><dd>{{ chunkingPreviewStats.minimum_chars }} / {{ chunkingPreviewStats.maximum_chars }}</dd></div><div><dt>超出范围</dt><dd>{{ chunkingPreviewStats.too_short + chunkingPreviewStats.too_long }}</dd></div></dl>
-                <div class="recipe-preview-list"><article v-for="chunk in chunkingPreview" :key="chunk.index" :style="{ '--preview-color': chunkingForm.color }"><header><span>Chunk {{ String(chunk.index).padStart(2, '0') }}</span><small>{{ chunk.char_count }} 字符</small></header><p v-if="chunk.heading_path.length" class="chunk-breadcrumb">{{ chunk.heading_path.join(' › ') }}</p><div class="chunk-markdown compact" v-html="renderMarkdownHtml(chunk.content)"></div></article></div>
+                <ChunkRunArtifacts :metadata="chunkingPreview[0]?.metadata" />
+                <div class="recipe-preview-list"><article v-for="chunk in chunkingPreview" :key="chunk.index" :style="{ '--preview-color': chunkingForm.color }"><header><span>Chunk {{ String(chunk.index).padStart(2, '0') }}</span><small>{{ chunk.char_count }} 字符</small></header><p v-if="chunk.heading_path.length" class="chunk-breadcrumb">{{ chunk.heading_path.join(' › ') }}</p><ChunkSemanticMetadata :metadata="chunk.metadata" /><div class="chunk-markdown compact" v-html="renderMarkdownHtml(chunk.content)"></div></article></div>
               </template>
               <div v-else-if="markdownReadyEntries.length" class="preview-empty subtle"><strong>参数尚未验证</strong><p>点击“生成预览”，确认块大小、标题路径和内容边界符合预期。</p></div>
             </section>

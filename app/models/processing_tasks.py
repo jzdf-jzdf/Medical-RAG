@@ -82,12 +82,17 @@ class ProcessingTask(Base):
         return self.resource_name
 
     @property
+    def has_chunking_result(self) -> bool:
+        return bool((self.result_json or {}).get("run_id"))
+
+    @property
     def operation(self) -> str:
         """Translate an internal executor key into a user-facing operation."""
 
         return {
             "pdf_to_markdown": "PDF 转 Markdown",
             "knowledge_base_build": "知识库向量构建",
+            "guideline_chunking": "医学指南语义切块",
             "embedding_model_download": "MedCPT 模型下载",
             "evidence_extraction": "证据候选抽取",
         }.get(self.task_type, "后台处理")
@@ -99,6 +104,7 @@ class ProcessingTask(Base):
         return {
             "pdf_to_markdown": "MinerU 4",
             "knowledge_base_build": "MedCPT 分块与嵌入 Worker",
+            "guideline_chunking": "Guideline Chunker / DeepSeek",
             "embedding_model_download": "Hugging Face / MedCPT",
             "evidence_extraction": "证据抽取 Worker",
         }.get(self.task_type, "后台 Worker")

@@ -1,0 +1,32 @@
+input:
+  encoding: utf-8
+
+taxonomy:
+  path: topics_hich_v1.yaml
+
+deepseek:
+  model: deepseek-v4-flash
+  api_key_env: DEEPSEEK_API_KEY
+  timeout_seconds: 180
+  max_attempts: 3
+  concurrent_requests: 1
+  json_output: true
+
+batching:
+  target_chars: 2600
+  max_chars: 4200
+  target_atoms: 12
+  max_atoms: 18
+  context_before_atoms: 2
+  context_after_atoms: 2
+
+chunking:
+  review_max_chars: 500
+
+summary:
+  enabled: true
+  max_chars: 300
+
+cache:
+  enabled: true
+  directory: .cache/guideline-chunker

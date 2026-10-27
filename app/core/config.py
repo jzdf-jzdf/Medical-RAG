@@ -40,6 +40,8 @@ class Settings(BaseSettings):
     embedding_model: str = ""
     embedding_api_key: str = ""
     embedding_timeout_seconds: int = Field(default=60, ge=5, le=600)
+    deepseek_api_key: str = ""
+    deepseek_base_url: str = "https://api.deepseek.com"
     search_candidate_limit: int = Field(default=5000, ge=100, le=100000)
     medcpt_cache_dir: Path = Path("./runtime/models/medcpt")
     medcpt_query_model: str = "ncbi/MedCPT-Query-Encoder"

@@ -13,6 +13,7 @@ from app.models import EmbeddingModel
 from app.repositories.processing_tasks import ProcessingTaskRepository
 from app.services.embeddings import EmbeddingError, download_medcpt_model
 from app.services.evidence_extraction import extract_collection_evidence
+from app.services.guideline_chunking import GuidelineChunkingError, run_summary
 from app.services.indexing import build_collection_index, mark_collection_failed
 from app.services.mineru import MinerUError
 from app.services.pdf_conversion import PdfConversionError, convert_document_pdf
@@ -154,6 +155,9 @@ class ProcessingTaskWorker:
                         ),
                     )
                 message = "MedCPT 向量索引已构建"
+            elif task_type == "guideline_chunking":
+                result = await self._execute_guideline_chunking(task_id, resource_id, payload)
+                message = "指南原子知识块已生成，报告和审计产物已保存"
             elif task_type == "embedding_model_download":
                 async with SessionLocal() as db:
                     model = await db.get(EmbeddingModel, resource_id)
@@ -193,24 +197,87 @@ class ProcessingTaskWorker:
             async with SessionLocal() as db:
                 if task_type == "knowledge_base_build":
                     await mark_collection_failed(db, resource_id, str(exc))
+                if isinstance(exc, GuidelineChunkingError):
+                    failed_task = await ProcessingTaskRepository(db).get(task_id)
+                    if failed_task:
+                        failed_task.result_json = run_summary(exc.run_id)
                 await ProcessingTaskRepository(db).fail(
                     task_id,
                     str(exc)
-                    if isinstance(exc, (MinerUError, PdfConversionError, EmbeddingError, ValueError))
+                    if isinstance(
+                        exc, (MinerUError, PdfConversionError, EmbeddingError, ValueError)
+                    )
                     else f"后台处理发生未预期错误：{exc}",
                 )
         finally:
             heartbeat.cancel()
             await asyncio.gather(heartbeat, return_exceptions=True)
 
+    async def _execute_guideline_chunking(self, task_id, document_id, payload) -> dict:
+        import json
+
+        from sqlalchemy import select
+        from sqlalchemy.orm import selectinload
+
+        from app.api.knowledge_bases import _chunk_item, _chunk_stats, _document_text
+        from app.models import Document
+        from app.services.guideline_chunking import artifact_urls, build_chunks_async, run_artifact
+
+        async with SessionLocal() as db:
+            document = await db.scalar(
+                select(Document)
+                .options(selectinload(Document.files))
+                .where(Document.id == document_id)
+            )
+            if document is None:
+                raise ValueError("文献不存在")
+            file = next((file for file in document.files if file.kind == "markdown"), None)
+            if (
+                file is None
+                or str(file.id) != payload["file_id"]
+                or file.sha256 != payload["sha256"]
+            ):
+                raise ValueError("Markdown 版本已变化，请重新提交切块任务")
+            text = await _document_text(document, strict=True)
+            title = document.title
+        config, chunks = await build_chunks_async(
+            text,
+            "guideline_semantic",
+            payload["config"],
+            document_id=document_id,
+            document_title=title,
+            preview=True,
+            on_progress=lambda phase, progress, message: self._update(
+                task_id, phase=phase, progress=progress, message=message
+            ),
+        )
+        if not chunks:
+            raise ValueError("指南没有生成可用知识块，请检查质量报告")
+        run_id = chunks[0].metadata["run_id"]
+        items = [_chunk_item(chunk) for chunk in chunks]
+        return {
+            "document_id": str(document_id),
+            "document_title": title,
+            "strategy": "guideline_semantic",
+            "config": config.model_dump(mode="json"),
+            "chunks": [item.model_dump(mode="json") for item in items],
+            "stats": _chunk_stats(items, {}).model_dump(),
+            "run_id": run_id,
+            "artifact_urls": artifact_urls(run_id),
+            "processing_report": json.loads(
+                run_artifact(run_id, "processing_report.json").read_text(encoding="utf-8")
+            ),
+            "manifest": json.loads(
+                run_artifact(run_id, "manifest.json").read_text(encoding="utf-8")
+            ),
+        }
+
     async def _execute_pdf(
         self, task_id: uuid.UUID, document_id: uuid.UUID, payload: dict
     ) -> dict[str, str]:
         """Execute MinerU conversion while persisting trustworthy progress."""
 
-        await self._update(
-            task_id, phase="parsing", progress=None, message="MinerU 正在解析 PDF"
-        )
+        await self._update(task_id, phase="parsing", progress=None, message="MinerU 正在解析 PDF")
         last_progress: int | None = None
         last_update_at = 0.0
 
@@ -275,6 +342,4 @@ class ProcessingTaskWorker:
         while True:
             await asyncio.sleep(settings.task_heartbeat_seconds)
             async with SessionLocal() as db:
-                await ProcessingTaskRepository(db).update_running(
-                    task_id, heartbeat_only=True
-                )
+                await ProcessingTaskRepository(db).update_running(task_id, heartbeat_only=True)

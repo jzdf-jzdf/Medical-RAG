@@ -27,6 +27,18 @@ async def create_collection(name: str, dimension: int) -> None:
         response.raise_for_status()
 
 
+async def delete_collection(name: str) -> None:
+    """Delete a Qdrant index; a missing collection is already clean."""
+
+    settings = get_settings()
+    url = f"{str(settings.qdrant_url).rstrip('/')}/collections/{name}"
+    async with httpx.AsyncClient(timeout=settings.qdrant_timeout_seconds) as client:
+        response = await client.delete(url)
+        if response.status_code == 404:
+            return
+        response.raise_for_status()
+
+
 async def upsert_points(name: str, rows: Iterable[dict[str, Any]]) -> None:
     settings = get_settings()
     url = f"{str(settings.qdrant_url).rstrip('/')}/collections/{name}/points"

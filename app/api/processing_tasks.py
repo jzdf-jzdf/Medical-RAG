@@ -126,9 +126,7 @@ async def _remove_processing_activities(
     )
 
 
-def _version_activity(
-    version: DocumentVersion, document_title: str
-) -> ProcessingTaskRead:
+def _version_activity(version: DocumentVersion, document_title: str) -> ProcessingTaskRead:
     """Project a historical Markdown version into the common activity shape.
 
     Uploads and moves predate the durable Worker table but remain valuable audit
@@ -175,9 +173,7 @@ async def list_processing_tasks(
     durable_tasks = list(
         (
             await db.scalars(
-                select(ProcessingTask)
-                .order_by(ProcessingTask.created_at.desc())
-                .limit(limit)
+                select(ProcessingTask).order_by(ProcessingTask.created_at.desc()).limit(limit)
             )
         ).all()
     )
@@ -248,6 +244,20 @@ async def get_processing_task(
     if task is None:
         raise HTTPException(status_code=404, detail="处理任务不存在")
     return task
+
+
+@router.get("/{task_id}/result")
+async def get_processing_task_result(
+    task_id: uuid.UUID, db: AsyncSession = Depends(get_db)
+) -> dict:
+    task = await ProcessingTaskRepository(db).get(task_id)
+    if task is None or task.task_type not in {"guideline_chunking", "knowledge_base_build"}:
+        raise HTTPException(status_code=404, detail="指南切块任务不存在")
+    if task.status == "failed" and (task.result_json or {}).get("run_id"):
+        return task.result_json
+    if task.status != "completed":
+        raise HTTPException(status_code=409, detail=task.error_message or "指南切块尚未完成")
+    return task.result_json or {}
 
 
 @router.post(

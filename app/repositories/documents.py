@@ -6,8 +6,9 @@ from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 
-from app.models import Collection, Document, DocumentFile, DocumentVersion
+from app.models import Collection, Document, DocumentFile, DocumentVersion, ProcessingTask
 from app.models.associations import collection_documents
+from app.repositories.processing_tasks import ACTIVE_STATUSES
 from app.schemas.documents import DocumentCreate, DocumentUpdate
 
 
@@ -259,6 +260,80 @@ class DocumentRepository:
             select(Document).options(selectinload(Document.files)).where(Document.id == document_id)
         )
         return await self.session.scalar(statement)
+
+    async def get_for_update(self, document_id: uuid.UUID) -> Document | None:
+        statement = (
+            select(Document)
+            .options(selectinload(Document.files))
+            .where(Document.id == document_id)
+            .with_for_update()
+        )
+        return await self.session.scalar(statement)
+
+    async def _protected_document_ids(self) -> set[uuid.UUID]:
+        return set(
+            (
+                await self.session.scalars(
+                    select(collection_documents.c.document_id).distinct()
+                )
+            ).all()
+        )
+
+    async def _processing_document_ids(self) -> set[uuid.UUID]:
+        return set(
+            (
+                await self.session.scalars(
+                    select(ProcessingTask.resource_id).where(
+                        ProcessingTask.resource_type == "document",
+                        ProcessingTask.status.in_(ACTIVE_STATUSES),
+                    ).distinct()
+                )
+            ).all()
+        )
+
+    async def deletion_summary(self) -> dict[str, int]:
+        document_ids = set((await self.session.scalars(select(Document.id))).all())
+        protected_ids = await self._protected_document_ids()
+        processing_ids = await self._processing_document_ids()
+        protected_ids.intersection_update(document_ids)
+        processing_ids.intersection_update(document_ids)
+        return {
+            "total_count": len(document_ids),
+            "protected_count": len(protected_ids),
+            "processing_count": len(processing_ids - protected_ids),
+            "deletable_count": len(document_ids - protected_ids - processing_ids),
+        }
+
+    async def delete_unprotected(self) -> tuple[list[str], dict[str, int]]:
+        # Lock the document rows before checking associations. A concurrent FK
+        # insert into collection_documents must wait for these locks, ensuring
+        # that membership is checked again against a fresh statement snapshot.
+        documents = list(
+            (
+                await self.session.scalars(
+                    select(Document)
+                    .options(selectinload(Document.files))
+                    .order_by(Document.id)
+                    .with_for_update()
+                )
+            ).all()
+        )
+        protected_ids = await self._protected_document_ids()
+        processing_ids = await self._processing_document_ids()
+        document_ids = {document.id for document in documents}
+        protected_ids.intersection_update(document_ids)
+        processing_ids.intersection_update(document_ids)
+        deletable_ids = document_ids - protected_ids - processing_ids
+        targets = [document for document in documents if document.id in deletable_ids]
+        storage_paths = [file.storage_path for document in targets for file in document.files]
+        for document in targets:
+            await self.session.delete(document)
+        await self.session.commit()
+        return storage_paths, {
+            "deleted_count": len(targets),
+            "protected_count": len(protected_ids),
+            "processing_count": len(processing_ids - protected_ids),
+        }
 
     async def _get_required(self, document_id: uuid.UUID) -> Document:
         document = await self.get(document_id)

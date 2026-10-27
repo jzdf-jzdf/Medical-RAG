@@ -2,7 +2,7 @@
 
 import itertools
 import re
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
@@ -45,18 +45,24 @@ class ChunkResult:
     char_start: int
     char_end: int
     heading_path: list[str]
+    metadata: dict = field(default_factory=dict)
 
 
 SUPPORTED_ENGINES = {
     "heading": "Markdown 标题分块",
     "recursive": "递归边界分块",
     "fixed": "固定长度分块",
+    "guideline_semantic": "医学指南原子知识分块（DeepSeek）",
 }
 
 
 def validate_chunking_config(strategy: str, raw: dict) -> ChunkingConfig:
     """Normalize legacy recipes and reject unsupported engines or unsafe ranges."""
 
+    if strategy == "guideline_semantic":
+        from app.services.guideline_chunking import GuidelineChunkingConfig
+
+        return GuidelineChunkingConfig.model_validate(raw or {})
     if strategy not in SUPPORTED_ENGINES:
         raise ValueError("不支持的切块引擎")
     legacy = dict(raw or {})
@@ -223,6 +229,8 @@ def build_chunks(
 ) -> tuple[ChunkingConfig, list[ChunkResult]]:
     """Execute one registered engine and return normalized config plus stable chunks."""
 
+    if strategy == "guideline_semantic":
+        raise ValueError("指南语义分块需要通过后台任务执行")
     config = validate_chunking_config(strategy, raw_config)
     normalized = text.replace("\r\n", "\n").strip()
     if not normalized:

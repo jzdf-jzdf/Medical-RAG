@@ -5,7 +5,8 @@ import uuid
 from datetime import UTC, datetime
 from pathlib import Path
 
-from fastapi import APIRouter, Depends, HTTPException, status
+from fastapi import APIRouter, Depends, HTTPException, Response, status
+from fastapi.responses import FileResponse
 from sqlalchemy import func, select, update
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -22,7 +23,7 @@ from app.models import (
     IndexVersion,
     ProcessingTask,
 )
-from app.repositories.processing_tasks import ProcessingTaskRepository
+from app.repositories.processing_tasks import ACTIVE_STATUSES, ProcessingTaskRepository
 from app.schemas.dashboard import ProcessingTaskRead
 from app.schemas.knowledge_bases import (
     ChunkingMethodCreate,
@@ -41,6 +42,9 @@ from app.schemas.knowledge_bases import (
     KnowledgeSearchResponse,
 )
 from app.services.chunking import ChunkResult, build_chunks, validate_chunking_config
+from app.services.guideline_chunking import engine_status, run_artifact
+from app.services.qdrant_store import collection_name as qdrant_collection_name
+from app.services.qdrant_store import delete_collection as delete_qdrant_collection
 from app.services.retrieval import search_collection
 
 router = APIRouter(tags=["knowledge bases"])
@@ -59,7 +63,7 @@ def _safe_attachment_path(storage_path: str) -> Path:
     return path
 
 
-async def _document_text(document: Document) -> str:
+async def _document_text(document: Document, *, strict: bool = False) -> str:
     """Load the only source format accepted by the knowledge-base pipeline: MD."""
 
     markdown_file = next((file for file in document.files if file.kind == "markdown"), None)
@@ -69,7 +73,8 @@ async def _document_text(document: Document) -> str:
     path = _safe_attachment_path(markdown_file.storage_path)
     if not path.exists():
         raise HTTPException(status_code=404, detail="MD 文件不存在")
-    return await asyncio.to_thread(path.read_text, encoding="utf-8-sig", errors="replace")
+    raw = await asyncio.to_thread(path.read_bytes)
+    return raw.decode("utf-8") if strict else raw.decode("utf-8-sig", errors="replace")
 
 
 def build_chunk_preview(text: str, strategy: str, config: dict) -> list[ChunkPreviewItem]:
@@ -96,6 +101,7 @@ def _chunk_item(chunk: ChunkResult) -> ChunkPreviewItem:
         char_end=chunk.char_end,
         char_count=len(chunk.content),
         heading_path=chunk.heading_path,
+        metadata=chunk.metadata,
     )
 
 
@@ -111,6 +117,51 @@ def _chunk_stats(chunks: list[ChunkPreviewItem], config: dict) -> ChunkPreviewSt
         too_short=sum(length < minimum for length in lengths),
         too_long=sum(length > maximum for length in lengths),
     )
+
+
+@router.get("/configurations/guideline-chunker")
+async def guideline_chunker_status() -> dict:
+    return engine_status()
+
+
+@router.get("/guideline-chunking/runs/{run_id}/artifacts/{name}", response_class=FileResponse)
+async def guideline_chunking_artifact(run_id: uuid.UUID, name: str) -> FileResponse:
+    try:
+        path = run_artifact(str(run_id), name)
+    except (ValueError, FileNotFoundError):
+        raise HTTPException(status_code=404, detail="指南切块产物不存在") from None
+    if not path.is_file():
+        raise HTTPException(status_code=404, detail="指南切块产物不存在")
+    return FileResponse(path, filename=name)
+
+
+async def _enqueue_guideline_preview(
+    document: Document, raw_config: dict, db: AsyncSession
+) -> ProcessingTask:
+    config = validate_chunking_config("guideline_semantic", raw_config).model_dump(mode="json")
+    if not engine_status()["api_key_configured"]:
+        raise HTTPException(
+            status_code=409,
+            detail="请在知识服务和 Worker 后端配置 DEEPSEEK_API_KEY 后使用指南语义切块",
+        )
+    file = next((file for file in document.files if file.kind == "markdown"), None)
+    if file is None:
+        raise HTTPException(status_code=409, detail="该文献没有 MD 版本")
+    payload = {"config": config, "file_id": str(file.id), "sha256": file.sha256}
+    repository = ProcessingTaskRepository(db)
+    active = await repository.active_for_resource(document.id)
+    if active:
+        if active.task_type == "guideline_chunking" and active.payload_json == payload:
+            return active
+        raise HTTPException(status_code=409, detail="该文献正在执行其他后台任务，完成后请重试")
+    task, _ = await repository.enqueue(
+        task_type="guideline_chunking",
+        resource_type="document",
+        resource_id=document.id,
+        resource_name=document.title,
+        payload=payload,
+    )
+    return task
 
 
 async def _get_knowledge_base(db: AsyncSession, collection_id: uuid.UUID) -> Collection | None:
@@ -135,12 +186,13 @@ async def list_chunking_methods(db: AsyncSession = Depends(get_db)) -> list[Chun
 
 @router.post(
     "/configurations/chunking-methods/preview",
-    response_model=ChunkRecipePreview,
+    response_model=ChunkRecipePreview | ProcessingTaskRead,
 )
 async def preview_chunking_recipe(
     payload: ChunkPreviewRequest,
+    response: Response,
     db: AsyncSession = Depends(get_db),
-) -> ChunkRecipePreview:
+) -> ChunkRecipePreview | ProcessingTask:
     """Dry-run an unsaved recipe against a real document without writing chunks."""
 
     document = await db.scalar(
@@ -151,6 +203,10 @@ async def preview_chunking_recipe(
     if document is None:
         raise HTTPException(status_code=404, detail="样本文献不存在")
     try:
+        if payload.strategy == "guideline_semantic":
+            task = await _enqueue_guideline_preview(document, payload.config, db)
+            response.status_code = 202
+            return task
         config, chunks = build_chunks(
             await _document_text(document), payload.strategy, payload.config
         )
@@ -363,7 +419,7 @@ async def create_knowledge_base(
         ).model_dump()
         # Chunks are committed as a single transaction: a partially built knowledge
         # base is never exposed if one document fails validation or splitting.
-        for document in documents:
+        for document in documents if method.strategy != "guideline_semantic" else []:
             markdown_file = next(file for file in document.files if file.kind == "markdown")
             _, chunks = build_chunks(
                 await _document_text(document), method.strategy, normalized_config
@@ -393,7 +449,7 @@ async def create_knowledge_base(
                         },
                     )
                 )
-        collection.status = "chunked"
+        collection.status = "configured" if method.strategy == "guideline_semantic" else "chunked"
         await db.commit()
     except IntegrityError as exc:
         await db.rollback()
@@ -422,7 +478,9 @@ async def get_knowledge_base(
 async def build_knowledge_base(
     collection_id: uuid.UUID, db: AsyncSession = Depends(get_db)
 ) -> ProcessingTask:
-    collection = await db.get(Collection, collection_id)
+    collection = await db.scalar(
+        select(Collection).where(Collection.id == collection_id).with_for_update()
+    )
     if collection is None:
         raise HTTPException(status_code=404, detail="知识库不存在")
     task, created = await ProcessingTaskRepository(db).enqueue(
@@ -522,22 +580,54 @@ async def activate_index_version(
 async def delete_knowledge_base(
     collection_id: uuid.UUID, db: AsyncSession = Depends(get_db)
 ) -> None:
-    collection = await db.get(Collection, collection_id)
+    collection = await db.scalar(
+        select(Collection).where(Collection.id == collection_id).with_for_update()
+    )
     if collection is None:
         raise HTTPException(status_code=404, detail="知识库不存在")
+    active_task = await db.scalar(
+        select(ProcessingTask.id).where(
+            ProcessingTask.resource_type == "knowledge_base",
+            ProcessingTask.resource_id == collection_id,
+            ProcessingTask.status.in_(ACTIVE_STATUSES),
+        )
+    )
+    if active_task is not None:
+        raise HTTPException(status_code=409, detail="知识库正在构建，完成后才能删除")
+
+    index_versions = list(
+        (
+            await db.scalars(
+                select(IndexVersion).where(IndexVersion.collection_id == collection_id)
+            )
+        ).all()
+    )
+    qdrant_collections = {
+        str(index.config.get("qdrant_collection") or qdrant_collection_name(index.id))
+        for index in index_versions
+    }
+    try:
+        for qdrant_name in qdrant_collections:
+            await delete_qdrant_collection(qdrant_name)
+    except Exception as exc:
+        raise HTTPException(
+            status_code=502,
+            detail="删除知识库向量索引失败，请检查 Qdrant 后重试",
+        ) from exc
     await db.delete(collection)
     await db.commit()
 
 
 @router.get(
     "/knowledge-bases/{collection_id}/documents/{document_id}/chunks",
-    response_model=DocumentChunkPreview,
+    response_model=DocumentChunkPreview | ProcessingTaskRead,
 )
 async def preview_document_chunks(
     collection_id: uuid.UUID,
     document_id: uuid.UUID,
+    response: Response,
     db: AsyncSession = Depends(get_db),
-) -> DocumentChunkPreview:
+) -> DocumentChunkPreview | ProcessingTask:
     collection = await _get_knowledge_base(db, collection_id)
     if collection is None:
         raise HTTPException(status_code=404, detail="知识库不存在")
@@ -565,9 +655,7 @@ async def preview_document_chunks(
     )
     if active_version:
         chunk_query = chunk_query.where(Chunk.index_version == active_version)
-    persisted = list(
-        (await db.scalars(chunk_query.order_by(Chunk.chunk_index))).all()
-    )
+    persisted = list((await db.scalars(chunk_query.order_by(Chunk.chunk_index))).all())
     if not active_version:
         persisted = _dedupe_chunk_rows(persisted)
     if persisted:
@@ -580,10 +668,17 @@ async def preview_document_chunks(
                 char_end=chunk.char_end,
                 char_count=len(chunk.content),
                 heading_path=chunk.heading_path or [],
+                metadata=chunk.metadata_json or {},
             )
             for index, chunk in enumerate(persisted, start=1)
         ]
     else:
+        if collection.chunking_method.strategy == "guideline_semantic":
+            task = await _enqueue_guideline_preview(
+                document, collection.chunking_method.config or {}, db
+            )
+            response.status_code = 202
+            return task
         chunks = build_chunk_preview(
             await _document_text(document),
             collection.chunking_method.strategy,

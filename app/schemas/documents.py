@@ -58,6 +58,19 @@ class DocumentList(BaseModel):
     page_size: int
 
 
+class DocumentDeletionSummary(BaseModel):
+    total_count: int
+    protected_count: int
+    processing_count: int
+    deletable_count: int
+
+
+class DocumentBulkDeletionResult(BaseModel):
+    deleted_count: int
+    protected_count: int
+    processing_count: int
+
+
 class AttachmentMove(BaseModel):
     target_document_id: uuid.UUID
 

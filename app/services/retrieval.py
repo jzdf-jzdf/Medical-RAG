@@ -302,6 +302,7 @@ async def search_collection(
                 "document_title": document.title,
                 "content": chunk.content,
                 "heading_path": chunk.heading_path or [],
+                "metadata": getattr(chunk, "metadata_json", None) or {},
                 "page_start": chunk.page_start,
                 "page_end": chunk.page_end,
                 "score": round(normalized, 6),

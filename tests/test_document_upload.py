@@ -117,7 +117,7 @@ def test_pdf_metadata_falls_back_when_optional_decoder_fails(tmp_path, monkeypat
 async def test_delete_document_rejects_knowledge_base_member(monkeypatch) -> None:
     document_id = uuid.uuid4()
     repository = SimpleNamespace(
-        get=AsyncMock(return_value=SimpleNamespace(files=[])),
+        get_for_update=AsyncMock(return_value=SimpleNamespace(files=[])),
         knowledge_base_names=AsyncMock(return_value=["脑出血指南库"]),
         delete=AsyncMock(),
     )

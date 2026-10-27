@@ -80,6 +80,7 @@ class ChunkPreviewItem(BaseModel):
     char_end: int
     char_count: int
     heading_path: list[str] = Field(default_factory=list)
+    metadata: dict = Field(default_factory=dict)
 
 
 class ChunkPreviewStats(BaseModel):
@@ -129,6 +130,7 @@ class KnowledgeSearchHit(BaseModel):
     document_title: str
     content: str
     heading_path: list[str]
+    metadata: dict = Field(default_factory=dict)
     page_start: int | None
     page_end: int | None
     score: float

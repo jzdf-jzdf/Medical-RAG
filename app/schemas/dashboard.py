@@ -53,6 +53,7 @@ class ProcessingTaskRead(BaseModel):
     started_at: datetime | None = None
     finished_at: datetime | None = None
     updated_at: datetime | None = None
+    has_chunking_result: bool = False
 
 
 class ProcessingTaskBulkDeleteRequest(BaseModel):

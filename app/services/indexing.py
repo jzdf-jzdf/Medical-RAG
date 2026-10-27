@@ -10,8 +10,9 @@ from sqlalchemy.orm import selectinload
 
 from app.core.config import get_settings
 from app.models import Chunk, Collection, Document, IndexVersion
-from app.services.chunking import build_chunks, validate_chunking_config
+from app.services.chunking import validate_chunking_config
 from app.services.embeddings import download_medcpt_model, embed_texts
+from app.services.guideline_chunking import build_chunks_async
 from app.services.qdrant_store import (
     collection_name as qdrant_collection_name,
 )
@@ -25,10 +26,10 @@ from app.services.qdrant_store import (
 ProgressCallback = Callable[[str, int, str], Awaitable[None]]
 
 
-async def _document_text(document) -> str:
+async def _document_text(document, *, strict: bool = False) -> str:
     from app.api.knowledge_bases import _document_text as read_document_text
 
-    return await read_document_text(document)
+    return await read_document_text(document, strict=strict)
 
 
 async def build_collection_index(
@@ -57,6 +58,7 @@ async def build_collection_index(
     method = collection.chunking_method
     model = collection.embedding_model
     if model.provider.lower().strip() == "medcpt":
+
         async def model_progress(phase: str, progress: int, message: str) -> None:
             if on_progress:
                 await on_progress(phase, max(5, round(progress * 0.3)), message)
@@ -86,8 +88,22 @@ async def build_collection_index(
         markdown_file = next((file for file in document.files if file.kind == "markdown"), None)
         if markdown_file is None:
             raise ValueError(f"文献“{document.title}”缺少 Markdown 文件")
-        _, chunks = build_chunks(
-            await _document_text(document), method.strategy, normalized_config
+
+        async def chunk_progress(phase, progress, message, document_number=document_number):
+            if on_progress:
+                fraction = 0 if progress is None else progress / 100
+                overall = 30 + round(((document_number - 1) + fraction) / total_documents * 25)
+                await on_progress(
+                    phase, overall, f"文献 {document_number}/{total_documents}：{message}"
+                )
+
+        _, chunks = await build_chunks_async(
+            await _document_text(document, strict=method.strategy == "guideline_semantic"),
+            method.strategy,
+            normalized_config,
+            document_id=document.id,
+            document_title=document.title,
+            on_progress=chunk_progress,
         )
         if not chunks:
             raise ValueError(f"文献“{document.title}”的 Markdown 内容为空")
@@ -104,6 +120,7 @@ async def build_collection_index(
                 char_start=item.char_start,
                 char_end=item.char_end,
                 metadata_json={
+                    **item.metadata,
                     "chunking_method_id": str(method.id),
                     "strategy": method.strategy,
                     "config": normalized_config,
@@ -111,9 +128,19 @@ async def build_collection_index(
             )
             chunk_rows.append(row)
             texts.append(item.embedding_text)
+        if method.strategy == "guideline_semantic" and chunks:
+            index.config = {
+                **index.config,
+                "guideline_runs": {
+                    **index.config.get("guideline_runs", {}),
+                    str(document.id): chunks[0].metadata["run_id"],
+                },
+            }
         if on_progress:
             progress = 30 + round(document_number / total_documents * 25)
-            await on_progress("chunking", progress, f"已完成 {document_number}/{total_documents} 篇文献分块")
+            await on_progress(
+                "chunking", progress, f"已完成 {document_number}/{total_documents} 篇文献分块"
+            )
 
     db.add_all(chunk_rows)
     # SQLAlchemy UUID defaults are assigned during flush. Qdrant point IDs
@@ -146,6 +173,9 @@ async def build_collection_index(
                     "document_id": str(row.document_id),
                     "collection_id": str(collection.id),
                     "index_version": version,
+                    "atomic_chunk_id": (row.metadata_json or {}).get("chunk_id"),
+                    "chunk_type": (row.metadata_json or {}).get("type"),
+                    "topic_tags": (row.metadata_json or {}).get("topic_tags", []),
                 },
             }
             for row in chunk_rows
@@ -194,4 +224,3 @@ async def mark_collection_failed(db: AsyncSession, collection_id: uuid.UUID, mes
         .values(status="failed", error_message=message[:4000])
     )
     await db.commit()
-

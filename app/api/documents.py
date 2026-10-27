@@ -24,6 +24,8 @@ from app.schemas.dashboard import ProcessingTaskRead
 from app.schemas.documents import (
     AttachmentMove,
     DocumentCreate,
+    DocumentBulkDeletionResult,
+    DocumentDeletionSummary,
     DocumentList,
     DocumentRead,
     DocumentUpdate,
@@ -326,6 +328,22 @@ async def list_documents(
     return DocumentList(items=items, total=total, page=page, page_size=page_size)
 
 
+@router.get("/deletion-summary", response_model=DocumentDeletionSummary)
+async def document_deletion_summary(
+    db: AsyncSession = Depends(get_db),
+) -> DocumentDeletionSummary:
+    return DocumentDeletionSummary(**await DocumentRepository(db).deletion_summary())
+
+
+@router.post("/delete-unprotected", response_model=DocumentBulkDeletionResult)
+async def delete_unprotected_documents(
+    db: AsyncSession = Depends(get_db),
+) -> DocumentBulkDeletionResult:
+    storage_paths, result = await DocumentRepository(db).delete_unprotected()
+    _remove_storage_paths(storage_paths)
+    return DocumentBulkDeletionResult(**result)
+
+
 @router.post("/from-file", response_model=DocumentRead, status_code=status.HTTP_201_CREATED)
 async def create_document_from_file(
     file: UploadFile = File(...), db: AsyncSession = Depends(get_db)
@@ -567,7 +585,7 @@ async def update_document(
 @router.delete("/{document_id}", status_code=status.HTTP_204_NO_CONTENT)
 async def delete_document(document_id: uuid.UUID, db: AsyncSession = Depends(get_db)) -> None:
     repository = DocumentRepository(db)
-    document: Document | None = await repository.get(document_id)
+    document: Document | None = await repository.get_for_update(document_id)
     if not document:
         raise HTTPException(status_code=404, detail="文献条目不存在")
     await _reject_active_processing_task(db, document_id)

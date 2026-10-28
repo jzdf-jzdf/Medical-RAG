@@ -8,8 +8,8 @@ from fastapi import HTTPException, UploadFile
 from pypdf import PdfWriter
 from pypdf.errors import DependencyError
 
-from app.api import documents as documents_api
-from app.api.documents import (
+from knowledge_api.api import documents as documents_api
+from knowledge_api.api.documents import (
     StoredUpload,
     _document_payload,
     _entry_title_from_filename,

@@ -3,10 +3,10 @@ import asyncio
 from fastapi.testclient import TestClient
 from pydantic import ValidationError
 
-from app.core.config import MCPServerSettings
-from app.main import app
-from app.schemas.evidence import ChatRequest, CitationCandidate
-from app.services.mcp import MCPOrchestrator
+from agent_api.core.config import MCPServerSettings
+from agent_api.main import app
+from agent_api.schemas.evidence import ChatRequest, CitationCandidate
+from agent_api.services.mcp import MCPOrchestrator
 
 
 def test_health() -> None:

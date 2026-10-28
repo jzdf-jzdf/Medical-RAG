@@ -5,9 +5,9 @@ from types import SimpleNamespace
 import pytest
 from fastapi import HTTPException, Response
 
-from app.services import guideline_chunking as engine
-from app.services.chunking import validate_chunking_config
-from app.vendor.guideline_chunker.models import SemanticBatchResponse
+from knowledge_api.services import guideline_chunking as engine
+from knowledge_api.services.chunking import validate_chunking_config
+from knowledge_api.vendor.guideline_chunker.models import SemanticBatchResponse
 
 TEXT = (
     "# 治疗\r\n\r\n脑出血是脑实质内的出血。\r\n\r\n推荐意见：应平稳降压（Ⅰ级推荐，A级证据）。\r\n"
@@ -165,7 +165,7 @@ def test_config_keeps_upstream_contract_and_rejects_arbitrary_paths_or_secrets()
 
 @pytest.mark.asyncio
 async def test_semantic_preview_enqueues_durable_task_without_running_model(monkeypatch):
-    from app.api import knowledge_bases as api
+    from knowledge_api.api import knowledge_bases as api
 
     task = SimpleNamespace(id=uuid.uuid4())
     document = SimpleNamespace(id=uuid.uuid4())
@@ -197,7 +197,7 @@ def test_artifact_whitelist_and_run_id_validation(configured_engine):
 
 @pytest.mark.asyncio
 async def test_result_endpoint_rejects_pending_and_unrelated_tasks(monkeypatch):
-    from app.api import processing_tasks as api
+    from knowledge_api.api import processing_tasks as api
 
     task = SimpleNamespace(task_type="guideline_chunking", status="running", error_message=None)
 
@@ -222,8 +222,8 @@ async def test_result_endpoint_rejects_pending_and_unrelated_tasks(monkeypatch):
 async def test_index_build_persists_semantic_metadata_and_qdrant_payload(
     configured_engine, monkeypatch
 ):
-    from app.models import IndexVersion
-    from app.services import indexing
+    from knowledge_api.models import IndexVersion
+    from knowledge_api.services import indexing
 
     collection = SimpleNamespace(
         id=uuid.uuid4(),

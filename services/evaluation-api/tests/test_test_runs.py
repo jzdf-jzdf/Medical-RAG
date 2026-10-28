@@ -4,11 +4,11 @@ from uuid import uuid4
 
 from fastapi.testclient import TestClient
 
-from app.api.test_runs import _choice_score
-from app.db import get_db
-from app.main import app
-from app.models import Dataset, EvaluationResult, EvaluationRun, Question
-from app.services.platform_client import get_platform_client
+from evaluation_api.api.test_runs import _choice_score
+from evaluation_api.db import get_db
+from evaluation_api.main import app
+from evaluation_api.models import Dataset, EvaluationResult, EvaluationRun, Question
+from evaluation_api.services.platform_client import get_platform_client
 
 
 class FakeScalars:

@@ -21,7 +21,7 @@ topic_tags、summary、recommendation_levels、字符范围、运行 ID 及来�
 
 知识 API 和 Worker 均需从环境获得 `DEEPSEEK_API_KEY`。
 可选 `DEEPSEEK_BASE_URL` 默认 `https://api.deepseek.com`。
-本机直接启动使用进程环境或 `medical-knowledge-api/.env`；Docker Compose 从
+本机直接启动使用进程环境或 `services/knowledge-api/.env`；Docker Compose 从
 启动命令的进程环境或部署目录 `.env` 读取并传给两个容器。密钥不进前端、
 分块方法 JSON、运行配置、产物或日志。
 

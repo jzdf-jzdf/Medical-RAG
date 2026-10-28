@@ -4,9 +4,9 @@ from alembic import context
 from sqlalchemy import pool
 from sqlalchemy.ext.asyncio import async_engine_from_config
 
-from app.core.config import get_settings
-from app.db.base import Base
-from app.models import agent  # noqa: F401
+from agent_api.core.config import get_settings
+from agent_api.db.base import Base
+from agent_api.models import agent  # noqa: F401
 
 config = context.config
 config.set_main_option("sqlalchemy.url", str(get_settings().database_url))

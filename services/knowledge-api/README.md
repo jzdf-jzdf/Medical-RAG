@@ -8,7 +8,7 @@ py -3.12 -m venv .venv
 .\.venv\Scripts\Activate.ps1
 pip install -e ".[dev]"
 alembic upgrade head
-uvicorn app.main:app --reload --port 8001
+uvicorn knowledge_api.main:app --reload --port 8001
 ```
 
 健康检查：`GET /health`；数据库就绪检查：`GET /ready`；OpenAPI：`/docs`。

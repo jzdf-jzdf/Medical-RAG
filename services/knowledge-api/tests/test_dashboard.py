@@ -1,9 +1,9 @@
 import uuid
 from datetime import UTC, datetime
 
-from app.api.processing_tasks import _version_activity
-from app.models import DocumentVersion
-from app.services.task_worker import progress_from_output
+from knowledge_api.api.processing_tasks import _version_activity
+from knowledge_api.models import DocumentVersion
+from knowledge_api.services.task_worker import progress_from_output
 
 
 def test_uploaded_version_is_exposed_as_completed_real_activity() -> None:

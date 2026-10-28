@@ -8,8 +8,8 @@ param(
 
 $ErrorActionPreference = 'Stop'
 $projectRoot = $PSScriptRoot
-$apiRoot = Join-Path $projectRoot 'medical-knowledge-api'
-$webRoot = Join-Path $projectRoot 'medical-knowledge-web'
+$apiRoot = Join-Path $projectRoot 'services\knowledge-api'
+$webRoot = Join-Path $projectRoot 'apps\knowledge-web'
 $runtimeRoot = Join-Path $projectRoot '.runtime'
 $logRoot = Join-Path $runtimeRoot 'logs'
 $pidFile = Join-Path $runtimeRoot 'knowledge-service.pids.json'
@@ -102,7 +102,7 @@ Write-Host '✓ PostgreSQL 17 已运行' -ForegroundColor Green
 
 $pythonPath = Join-Path $apiRoot '.venv\Scripts\python.exe'
 if (-not (Test-Path -LiteralPath $pythonPath -PathType Leaf)) {
-    throw "找不到后端虚拟环境：$pythonPath。请先在 medical-knowledge-api 中运行 uv sync --extra dev。"
+    throw "找不到后端虚拟环境：$pythonPath。请先在 services\knowledge-api 中运行 uv sync --extra dev。"
 }
 
 # Apply schema changes before starting or reusing the API. Alembic migrations are
@@ -136,7 +136,7 @@ if (Test-KnowledgeApi -Uri $apiHealthUrl) {
     $apiOut = Join-Path $logRoot 'knowledge-api.log'
     $apiErr = Join-Path $logRoot 'knowledge-api.error.log'
     $apiProcess = Start-Process -FilePath $pythonPath `
-        -ArgumentList @('-m', 'uvicorn', 'app.main:app', '--host', $BindAddress, '--port', "$ApiPort", '--reload') `
+        -ArgumentList @('-m', 'uvicorn', 'knowledge_api.main:app', '--host', $BindAddress, '--port', "$ApiPort", '--reload') `
         -WorkingDirectory $apiRoot `
         -WindowStyle Hidden `
         -RedirectStandardOutput $apiOut `

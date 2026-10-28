@@ -1,4 +1,4 @@
-from app.services.evaluation import evaluate_layers
+from evaluation_api.services.evaluation import evaluate_layers
 
 
 def test_three_layer_metrics_and_gate() -> None:

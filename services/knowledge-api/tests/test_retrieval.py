@@ -1,4 +1,4 @@
-from app.services.retrieval import _lexical_score
+from knowledge_api.services.retrieval import _lexical_score
 
 
 def test_lexical_score_matches_chinese_bigrams() -> None:

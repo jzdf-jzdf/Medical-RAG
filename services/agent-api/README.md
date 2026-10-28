@@ -10,7 +10,7 @@ py -3.12 -m venv .venv
 .\.venv\Scripts\Activate.ps1
 pip install -e ".[dev]"
 alembic upgrade head
-uvicorn app.main:app --reload --port 8002
+uvicorn agent_api.main:app --reload --port 8002
 ```
 
 至少配置 `MODEL_API_KEY`。如需连接当前项目的知识服务，可在 `.env` 中加入：

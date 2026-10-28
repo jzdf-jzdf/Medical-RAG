@@ -1,0 +1,12 @@
+[project]
+name = "medical-rag-monorepo"
+version = "0.1.0"
+requires-python = ">=3.12"
+dependencies = []
+
+[tool.uv]
+package = false
+environments = ["sys_platform == 'win32' or sys_platform == 'linux'"]
+
+[tool.uv.workspace]
+members = ["services/*", "packages/python/*"]

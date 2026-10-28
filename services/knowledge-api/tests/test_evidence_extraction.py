@@ -1,4 +1,4 @@
-from app.services.evidence_extraction import evidence_sentences
+from knowledge_api.services.evidence_extraction import evidence_sentences
 
 
 def test_evidence_sentences_skip_headings_and_keep_recommendations() -> None:

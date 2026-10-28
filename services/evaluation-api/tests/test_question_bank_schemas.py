@@ -1,7 +1,7 @@
 import pytest
 from pydantic import ValidationError
 
-from app.schemas.question_bank import QuestionCreate
+from evaluation_api.schemas.question_bank import QuestionCreate
 
 
 def test_single_choice_normalizes_answer_and_options() -> None:

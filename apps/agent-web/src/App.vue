@@ -2,7 +2,7 @@
 import { computed, nextTick, onMounted, ref } from 'vue'
 import DOMPurify from 'dompurify'
 import { parseAnswerMarkdown } from './markdown'
-import AccountMenu from './components/AccountMenu.vue'
+import { AccountMenu } from '@medical-rag/platform-ui'
 
 import {
   createModel,

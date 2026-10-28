@@ -1,7 +1,7 @@
 from fastapi.testclient import TestClient
 
-from app.main import app
-from app.services.platform_client import PlatformClient, get_platform_client
+from evaluation_api.main import app
+from evaluation_api.services.platform_client import PlatformClient, get_platform_client
 
 
 class FakePlatformClient:

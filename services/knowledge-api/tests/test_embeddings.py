@@ -1,6 +1,6 @@
 import math
 
-from app.services.embeddings import _article_pairs, builtin_embedding
+from knowledge_api.services.embeddings import _article_pairs, builtin_embedding
 
 
 def test_builtin_embedding_is_normalized_and_deterministic() -> None:

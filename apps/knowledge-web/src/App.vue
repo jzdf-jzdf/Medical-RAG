@@ -6,7 +6,7 @@ import { useRoute, useRouter } from 'vue-router'
 import ChunkSemanticMetadata from './components/ChunkSemanticMetadata.vue'
 import ChunkRunArtifacts from './components/ChunkRunArtifacts.vue'
 import ChunkingMethodDetails from './components/ChunkingMethodDetails.vue'
-import AccountMenu from './components/AccountMenu.vue'
+import { AccountMenu } from '@medical-rag/platform-ui'
 
 type Tab = 'welcome' | 'documents' | 'configurations' | 'knowledge' | 'tasks'
 type NavigationTab = Exclude<Tab, 'welcome'>
@@ -1655,7 +1655,7 @@ onBeforeUnmount(() => {
           <span>{{ tab.label }}</span>
         </RouterLink>
       </nav>
-      <AccountMenu />
+      <AccountMenu accent="primary" hide-on-mobile />
     </aside>
 
     <main>

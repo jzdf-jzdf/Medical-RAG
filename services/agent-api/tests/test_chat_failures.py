@@ -6,9 +6,9 @@ from types import SimpleNamespace
 import pytest
 from starlette.requests import Request
 
-import app.api.chat as chat_api
-from app.models import AgentRun, AuditEvent, Conversation, Message
-from app.schemas.evidence import ChatRequest
+import agent_api.api.chat as chat_api
+from agent_api.models import AgentRun, AuditEvent, Conversation, Message
+from agent_api.schemas.evidence import ChatRequest
 
 
 class MemorySession:

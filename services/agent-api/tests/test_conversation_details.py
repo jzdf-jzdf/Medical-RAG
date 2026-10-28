@@ -1,7 +1,7 @@
 import uuid
 
-from app.api.conversations import _citation_payload, _tool_call_payload
-from app.models import AnswerCitation, ToolCall
+from agent_api.api.conversations import _citation_payload, _tool_call_payload
+from agent_api.models import AnswerCitation, ToolCall
 
 
 def test_persisted_tool_call_and_citation_restore_full_run_detail() -> None:

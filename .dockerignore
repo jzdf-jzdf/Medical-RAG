@@ -1,0 +1,14 @@
+.git
+.venv
+**/.venv
+node_modules
+**/node_modules
+dist
+**/dist
+runtime
+.runtime
+artifacts
+test-results
+__pycache__
+**/__pycache__
+*.pyc

@@ -1,6 +1,6 @@
 <script setup lang="ts">
 import { computed, onBeforeUnmount, onMounted, reactive, ref, shallowRef } from 'vue'
-import AccountMenu from './components/AccountMenu.vue'
+import { AccountMenu } from '@medical-rag/platform-ui'
 
 import {
   createQuestion, createQuestionBank, createQuestionsBulk, fetchDocumentChunks,

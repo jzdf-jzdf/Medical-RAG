@@ -325,7 +325,7 @@ if ($Force -and $unconfirmed.Count -gt 0) {
 }
 
 if ($IncludeDocker) {
-    $compose = Join-Path $Root 'medical-platform-deploy\compose.yaml'
+    $compose = Join-Path $Root 'infra\platform\compose.yaml'
     if (Test-Path $compose) {
         Write-Host '停止 Docker 部署栈 ...'
         docker compose -f $compose down 2>&1 | ForEach-Object { Write-Host ("  " + $_) }

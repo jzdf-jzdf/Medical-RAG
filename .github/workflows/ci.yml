@@ -1,0 +1,41 @@
+name: Monorepo CI
+
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+
+jobs:
+  api-tests:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        service:
+          - services/knowledge-api
+          - services/agent-api
+          - services/evaluation-api
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v6
+        with:
+          enable-cache: true
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: uv sync --project "${{ matrix.service }}" --extra dev --locked
+      - run: uv run pytest
+        working-directory: ${{ matrix.service }}
+
+  web-build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: npm
+      - run: npm ci
+      - run: npm run build
+      - run: npm run test:web
+      - run: docker compose -f infra/platform/compose.yaml config --quiet

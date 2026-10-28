@@ -1,6 +1,6 @@
-from app.api.chat import _exception_detail
-from app.services.agent import MedicalAgent, _extract_knowledge_evidence, _parse_json_object
-from app.services.mcp_client import MCPToolbox, ToolDefinition, ToolOutput, _mcp_http_timeout
+from agent_api.api.chat import _exception_detail
+from agent_api.services.agent import MedicalAgent, _extract_knowledge_evidence, _parse_json_object
+from agent_api.services.mcp_client import MCPToolbox, ToolDefinition, ToolOutput, _mcp_http_timeout
 
 
 class FakeModel:

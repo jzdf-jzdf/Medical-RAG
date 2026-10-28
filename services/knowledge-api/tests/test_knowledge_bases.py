@@ -2,8 +2,8 @@ from types import SimpleNamespace
 
 import pytest
 
-from app.api.knowledge_bases import _dedupe_chunk_rows, build_chunk_preview
-from app.services.chunking import build_chunks
+from knowledge_api.api.knowledge_bases import _dedupe_chunk_rows, build_chunk_preview
+from knowledge_api.services.chunking import build_chunks
 
 
 def test_fixed_chunk_preview_respects_maximum_size() -> None:

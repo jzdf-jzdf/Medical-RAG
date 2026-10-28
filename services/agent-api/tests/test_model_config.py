@@ -1,6 +1,6 @@
-from app.core.config import Settings
-from app.schemas.models import ModelConfigRead
-from app.services.crypto import decrypt_secret, encrypt_secret
+from agent_api.core.config import Settings
+from agent_api.schemas.models import ModelConfigRead
+from agent_api.services.crypto import decrypt_secret, encrypt_secret
 
 
 def test_model_api_never_exposes_api_key() -> None:

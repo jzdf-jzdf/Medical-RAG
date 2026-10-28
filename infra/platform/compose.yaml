@@ -9,14 +9,31 @@ services:
     depends_on: [knowledge-web, agent-web, evaluation-web, knowledge-api, agent-api, evaluation-api]
 
   knowledge-web:
-    build: ../medical-knowledge-web
+    build:
+      context: ../..
+      dockerfile: infra/docker/web.Dockerfile
+      args:
+        APP_NAME: knowledge-web
+        APP_BASE: knowledge
   agent-web:
-    build: ../medical-agent-web
+    build:
+      context: ../..
+      dockerfile: infra/docker/web.Dockerfile
+      args:
+        APP_NAME: agent-web
+        APP_BASE: agent
   evaluation-web:
-    build: ../medical-evaluation-web
+    build:
+      context: ../..
+      dockerfile: infra/docker/web.Dockerfile
+      args:
+        APP_NAME: evaluation-web
+        APP_BASE: evaluation
 
   knowledge-api:
-    build: ../medical-knowledge-api
+    build:
+      context: ../..
+      dockerfile: services/knowledge-api/Dockerfile
     environment:
       APP_ENV: development
       DATABASE_URL: postgresql+asyncpg://knowledge:knowledge@knowledge-db:5432/knowledge_db
@@ -45,8 +62,10 @@ services:
       retries: 30
 
   knowledge-worker:
-    build: ../medical-knowledge-api
-    command: ["python", "-m", "app.worker"]
+    build:
+      context: ../..
+      dockerfile: services/knowledge-api/Dockerfile
+    command: ["python", "-m", "knowledge_api.worker"]
     environment:
       APP_ENV: development
       DATABASE_URL: postgresql+asyncpg://knowledge:knowledge@knowledge-db:5432/knowledge_db
@@ -69,7 +88,9 @@ services:
         condition: service_started
 
   agent-api:
-    build: ../medical-agent-api
+    build:
+      context: ../..
+      dockerfile: services/agent-api/Dockerfile
     environment:
       APP_ENV: development
       DATABASE_URL: postgresql+asyncpg://agent:agent@agent-db:5432/agent_db
@@ -93,7 +114,9 @@ services:
         condition: service_healthy
 
   evaluation-api:
-    build: ../medical-evaluation-api
+    build:
+      context: ../..
+      dockerfile: services/evaluation-api/Dockerfile
     environment:
       APP_ENV: development
       DATABASE_URL: postgresql+asyncpg://evaluation:evaluation@evaluation-db:5432/evaluation_db

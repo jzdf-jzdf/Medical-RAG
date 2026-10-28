@@ -2,8 +2,8 @@ from types import SimpleNamespace
 
 import pytest
 
-import app.services.harness as harness_module
-from app.core.config import get_settings
+import agent_api.services.harness as harness_module
+from agent_api.core.config import get_settings
 
 
 def test_harness_empty_final_response_reports_finish_reason(monkeypatch, tmp_path):

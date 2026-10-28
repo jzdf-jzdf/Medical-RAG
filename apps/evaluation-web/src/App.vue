@@ -1,6 +1,6 @@
 <script setup lang="ts">
 import { computed, onBeforeUnmount, onMounted, reactive, ref, shallowRef } from 'vue'
-import { AccountMenu } from '@medical-rag/platform-ui'
+import { PlatformSidebar } from '@medical-rag/platform-ui'
 
 import {
   createQuestion, createQuestionBank, createQuestionsBulk, fetchDocumentChunks,
@@ -468,20 +468,7 @@ onBeforeUnmount(() => {
 
 <template>
   <div class="platform-frame">
-    <aside class="platform-sidebar">
-      <a class="brand" href="/knowledge/" aria-label="返回知识空间">
-        <span class="brand-mark" aria-hidden="true">
-          <svg viewBox="0 0 26 12"><path d="M0 0h2v12H0zM12 0H6C4.9 0 4 .9 4 2v8c0 1.1.9 2 2 2h6v-2H6V2h6zM15 0h2v5h7V0h2v12h-2V7h-7v5h-2z" /></svg>
-        </span>
-        <span><strong>循证医学平台</strong><small>ICH EVIDENCE OS</small></span>
-      </a>
-
-      <div class="platform-switcher" aria-label="平台应用">
-        <a href="/knowledge/">知识空间</a>
-        <a href="/agent/">智能问答</a>
-        <a class="active" href="/evaluation/" aria-current="page">评测中心</a>
-      </div>
-
+    <PlatformSidebar class="evaluation-sidebar" active-app="evaluation" aria-label="评测中心导航">
       <nav class="primary-nav" aria-label="评测中心导航">
         <span class="nav-label">题库工作区</span>
         <button :class="{ active: activeView === 'questions' }" type="button" @click="navigate('questions')">
@@ -502,8 +489,7 @@ onBeforeUnmount(() => {
         </button>
       </nav>
 
-      <AccountMenu />
-    </aside>
+    </PlatformSidebar>
 
     <div class="app-shell">
       <header class="topbar">

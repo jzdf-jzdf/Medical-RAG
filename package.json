@@ -8,6 +8,6 @@
   ],
   "scripts": {
     "build": "npm run build --workspaces --if-present",
-    "test:web": "node --test apps/agent-web/tests/*.test.mjs"
+    "test:web": "node --test apps/agent-web/tests/*.test.mjs packages/web/platform-ui/tests/*.test.mjs"
   }
 }

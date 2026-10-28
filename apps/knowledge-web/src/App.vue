@@ -6,7 +6,7 @@ import { useRoute, useRouter } from 'vue-router'
 import ChunkSemanticMetadata from './components/ChunkSemanticMetadata.vue'
 import ChunkRunArtifacts from './components/ChunkRunArtifacts.vue'
 import ChunkingMethodDetails from './components/ChunkingMethodDetails.vue'
-import { AccountMenu } from '@medical-rag/platform-ui'
+import { PlatformSidebar } from '@medical-rag/platform-ui'
 
 type Tab = 'welcome' | 'documents' | 'configurations' | 'knowledge' | 'tasks'
 type NavigationTab = Exclude<Tab, 'welcome'>
@@ -1635,28 +1635,20 @@ onBeforeUnmount(() => {
 
 <template>
   <div class="shell">
-    <aside>
-      <RouterLink class="brand" :to="tabPaths.welcome" aria-label="返回欢迎页">
-        <span class="brand-mark" aria-hidden="true">
-          <svg class="brand-glyph" viewBox="0 0 26 12" focusable="false">
-            <path d="M0 0h2v12H0zM12 0H6C4.9 0 4 .9 4 2v8c0 1.1.9 2 2 2h6v-2H6V2h6zM15 0h2v5h7V0h2v12h-2V7h-7v5h-2z" />
-          </svg>
-        </span>
-        <span class="brand-copy"><strong>循证医学平台</strong><small>ICH EVIDENCE OS</small></span>
-      </RouterLink>
-      <div class="platform-switcher" role="navigation" aria-label="平台应用切换">
-        <a class="active" href="/knowledge/" aria-current="page">知识空间</a>
-        <a href="/agent/">智能问答</a>
-        <a href="/evaluation/">评测中心</a>
-      </div>
+    <PlatformSidebar
+      class="knowledge-sidebar"
+      active-app="knowledge"
+      aria-label="知识空间导航"
+      account-accent="primary"
+      hide-account-on-mobile
+    >
       <p class="sidebar-section-label">知识工作台</p>
-      <nav aria-label="知识服务导航">
+      <nav class="knowledge-business-nav" aria-label="知识服务导航">
         <RouterLink v-for="tab in tabs" :key="tab.id" class="nav-item" :class="{ active: activeTab === tab.id }" :aria-current="activeTab === tab.id ? 'page' : undefined" :to="tab.path">
           <span>{{ tab.label }}</span>
         </RouterLink>
       </nav>
-      <AccountMenu accent="primary" hide-on-mobile />
-    </aside>
+    </PlatformSidebar>
 
     <main>
       <div v-if="notice" class="notice" :class="notice.kind" :role="notice.kind === 'error' ? 'alert' : 'status'"><span>{{ notice.message }}</span><button type="button" aria-label="关闭提示" @click="notice = null">×</button></div>

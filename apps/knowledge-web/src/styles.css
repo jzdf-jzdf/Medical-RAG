@@ -21,45 +21,8 @@ body { margin: 0; min-width: 320px; }
   background: #f4f7f6;
 }
 main { min-width: 0; }
-aside {
-  min-height: 100vh;
-  border-right: 1px solid var(--line);
-  background: #fbfcfc;
-  color: var(--ink);
-  padding: 26px 20px 22px;
-  display: flex;
-  flex-direction: column;
-}
-.brand {
-  width: 100%; display: flex; gap: 12px; align-items: center; margin: 0 0 20px;
-  padding: 4px; border-radius: 10px; background: transparent; color: inherit;
-  box-shadow: none; text-align: left; text-decoration: none;
-}
-.brand:hover { background: var(--primary-soft); transform: none; box-shadow: none; }
-.brand-mark {
-  width: 42px; height: 42px; display: grid; flex: 0 0 42px; place-items: center;
-  border-radius: 11px; background: var(--primary); color: #fff;
-  box-shadow: 0 7px 18px rgba(20,115,109,.18);
-}
-.brand-glyph { display: block; width: 26px; height: 12px; fill: currentColor; }
-.brand-copy { min-width: 0; }
-.brand strong, .brand small { display: block; }
-.brand strong { font-size: 15px; letter-spacing: .03em; }
-.brand small { margin-top: 4px; color: #84979a; font: 600 8px/1.2 ui-monospace, SFMono-Regular, Consolas, monospace; letter-spacing: .12em; }
-.platform-switcher {
-  display: grid; grid-template-columns: repeat(3, 1fr); gap: 3px;
-  margin: 0 0 28px; padding: 4px; border: 1px solid var(--line);
-  border-radius: 10px; background: #f0f4f3;
-}
-.platform-switcher a {
-  min-width: 0; padding: 8px 2px; border-radius: 7px; color: #71878a;
-  font-size: 10px; font-weight: 650; text-align: center; text-decoration: none;
-  transition: color .18s ease, background-color .18s ease, box-shadow .18s ease;
-}
-.platform-switcher a:hover { color: var(--primary); background: rgba(255,255,255,.7); }
-.platform-switcher a.active { color: #0e5b57; background: #fff; box-shadow: 0 4px 12px rgba(34,74,72,.08); }
 .sidebar-section-label { margin: 0 10px 10px; color: #91a1a3; font: 700 9px/1.4 ui-monospace, SFMono-Regular, Consolas, monospace; letter-spacing: .14em; text-transform: uppercase; }
-nav { display: grid; gap: 7px; }
+.knowledge-business-nav { display: grid; gap: 7px; }
 main { padding: 46px clamp(28px, 5vw, 76px); }
 header { display: flex; justify-content: space-between; align-items: end; padding: 8px 2px 34px; }
 h1 {
@@ -80,14 +43,14 @@ button svg {
   width: 18px; height: 18px; fill: none; stroke: currentColor;
   stroke-width: 1.8; stroke-linecap: round; stroke-linejoin: round;
 }
-nav .nav-item {
+.knowledge-business-nav .nav-item {
   width: 100%; display: flex; justify-content: space-between; align-items: center;
   color: #607b7e; background: transparent; padding: 11px 12px; border-radius: 8px;
   box-shadow: none; text-align: left; text-decoration: none; font-weight: 500; cursor: pointer;
   transition: color .2s ease, background .2s ease, transform .2s ease;
 }
-nav .nav-item:hover { color: var(--primary); background: #f0f5f4; transform: translateX(2px); box-shadow: none; }
-nav .nav-item.active { color: #0e5b57; background: var(--primary-soft); box-shadow: inset 3px 0 0 var(--primary); }
+.knowledge-business-nav .nav-item:hover { color: var(--primary); background: #f0f5f4; transform: translateX(2px); box-shadow: none; }
+.knowledge-business-nav .nav-item.active { color: #0e5b57; background: var(--primary-soft); box-shadow: inset 3px 0 0 var(--primary); }
 .text-action {
   color: #6b9693; background: transparent; padding: 6px 0; border-radius: 0;
   box-shadow: none; font-size: 13px; font-weight: 600;
@@ -686,11 +649,19 @@ input:focus-visible, select:focus-visible, textarea:focus-visible { outline: non
 }
 @media (max-width: 800px) {
   .shell { grid-template-columns: 1fr; }
-  aside { min-width: 0; min-height: auto; overflow: hidden; padding: 14px 16px; border-right: 0; border-bottom: 1px solid var(--line); }
-  .brand { width: auto; margin: 0 0 14px; }
-  .brand small, .sidebar-section-label { display: none; }
-  nav { width: 100%; max-width: 100%; display: flex; gap: 6px; overflow-x: auto; }
-  nav .nav-item { width: auto; flex: 0 0 auto; padding: 9px 11px; font-size: 12px; }
+  .knowledge-sidebar {
+    --platform-sidebar-width: 100%;
+    --platform-sidebar-min-height: auto;
+    --platform-sidebar-padding: 14px 16px;
+    --platform-sidebar-border-right: 0;
+    --platform-sidebar-border-bottom: 1px solid var(--line);
+    --platform-brand-margin: 0 0 14px;
+    --platform-brand-subtitle-display: none;
+    overflow: hidden;
+  }
+  .sidebar-section-label { display: none; }
+  .knowledge-business-nav { width: 100%; max-width: 100%; display: flex; gap: 6px; overflow-x: auto; }
+  .knowledge-business-nav .nav-item { width: auto; flex: 0 0 auto; padding: 9px 11px; font-size: 12px; }
   main { padding: 28px 18px; }
   header { align-items: flex-start; flex-direction: column; gap: 22px; }
   header button { align-self: flex-start; white-space: nowrap; padding-inline: 16px; }

@@ -101,6 +101,9 @@ export interface TestRunSummary {
   status: string
   total_questions: number
   completed_questions: number
+  attempt_count: number
+  cancel_requested: boolean
+  error?: string | null
   started_at: string
   finished_at?: string | null
 }
@@ -119,3 +122,25 @@ export interface TestQuestionResult {
   error?: string | null
 }
 export interface TestRunDetail extends TestRunSummary { results: TestQuestionResult[] }
+
+export interface RetrievalTextMatch {
+  reference_index: number
+  reference_text: string
+  retrieved_rank: number | null
+  retrieved_text: string
+  document_id?: string | null
+  chunk_id?: string | null
+  title?: string | null
+  recall: number
+  precision: number
+  f1: number
+}
+
+export interface RetrievalLayerScore {
+  score: number | null
+  method?: string | null
+  source?: string | null
+  metrics?: Record<string, number | null>
+  matches?: RetrievalTextMatch[]
+  issues?: string[]
+}

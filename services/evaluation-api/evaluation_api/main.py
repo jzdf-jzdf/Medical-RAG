@@ -2,6 +2,7 @@ from contextlib import asynccontextmanager
 
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
+from medical_platform_core import instrument, metrics_app
 from sqlalchemy import text
 
 from evaluation_api.api.evaluation import router as evaluation_router
@@ -10,15 +11,22 @@ from evaluation_api.api.test_runs import router as test_runs_router
 from evaluation_api.api.workbench import router as workbench_router
 from evaluation_api.core.config import get_settings
 from evaluation_api.db import engine
-from medical_platform_core import instrument, metrics_app
+from evaluation_api.services.run_queue import EvaluationRunDispatcher
 
 settings = get_settings()
 
 
 @asynccontextmanager
 async def lifespan(_: FastAPI):
-    yield
-    await engine.dispose()
+    dispatcher = EvaluationRunDispatcher(settings) if settings.evaluation_dispatcher_enabled else None
+    if dispatcher:
+        await dispatcher.start()
+    try:
+        yield
+    finally:
+        if dispatcher:
+            await dispatcher.stop()
+        await engine.dispose()
 
 
 app = FastAPI(title="Medical Evaluation API", version="0.1.0", lifespan=lifespan)

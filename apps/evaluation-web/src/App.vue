@@ -1,11 +1,13 @@
 <script setup lang="ts">
 import { computed, onBeforeUnmount, onMounted, reactive, ref, shallowRef } from 'vue'
 import { PlatformSidebar } from '@medical-rag/platform-ui'
+import QuestionEvidence from './components/QuestionEvidence.vue'
+import RetrievalComparison from './components/RetrievalComparison.vue'
 
 import {
   createQuestion, createQuestionBank, createQuestionsBulk, fetchDocumentChunks,
-  createTestRun, fetchKnowledgeBases, fetchQuestionBank, fetchQuestionBanks, fetchQuestions,
-  fetchTestRun, fetchTestRuns, generateQuestions,
+  cancelTestRun, createTestRun, fetchKnowledgeBases, fetchQuestionBank, fetchQuestionBanks,
+  fetchQuestions, fetchTestRun, fetchTestRuns, generateQuestions, retryTestRun, updateQuestionBank,
 } from './api'
 import type {
   DocumentChunks, GeneratedQuestion, KnowledgeBaseSummary, QuestionBankDetail,
@@ -26,6 +28,7 @@ const loadingBank = ref(false)
 const loadError = ref('')
 const notice = ref<Notice | null>(null)
 let noticeTimer: ReturnType<typeof setTimeout> | null = null
+let testRunPollTimer: ReturnType<typeof setTimeout> | null = null
 
 const questionQuery = ref('')
 const questionTypeFilter = ref<'all' | QuestionType>('all')
@@ -35,6 +38,10 @@ const openQuestionIds = ref<Set<string>>(new Set())
 const showBankDialog = ref(false)
 const savingBank = ref(false)
 const bankForm = reactive({ name: '', description: '' })
+const showDescriptionDialog = ref(false)
+const bankDescription = ref('')
+const savingDescription = ref(false)
+const descriptionError = ref('')
 const showQuestionDialog = ref(false)
 const savingQuestion = ref(false)
 const questionForm = reactive({
@@ -77,6 +84,7 @@ const selectedTestKnowledgeBaseId = ref('')
 const loadingTestRuns = ref(false)
 const runningTest = ref(false)
 const testError = ref('')
+const activeRunStatuses = new Set(['queued', 'running', 'cancelling'])
 
 const styles: Array<{ value: QuestionStyle; label: string; hint: string }> = [
   { value: 'patient', label: '患者', hint: '就诊者或家属自然提问' },
@@ -194,8 +202,39 @@ async function openTestRun(id: string) {
   testError.value = ''
   try {
     activeTestRun.value = await fetchTestRun(id)
+    scheduleTestRunPoll()
   } catch (error) {
     testError.value = messageOf(error)
+  }
+}
+
+function scheduleTestRunPoll() {
+  if (testRunPollTimer) clearTimeout(testRunPollTimer)
+  testRunPollTimer = null
+  if (!activeTestRun.value || !activeRunStatuses.has(activeTestRun.value.status)) return
+  testRunPollTimer = setTimeout(() => { void refreshActiveTestRun() }, 2000)
+}
+
+async function refreshActiveTestRun() {
+  const current = activeTestRun.value
+  if (!current) return
+  try {
+    const updated = await fetchTestRun(current.id)
+    const wasActive = activeRunStatuses.has(current.status)
+    activeTestRun.value = updated
+    if (wasActive && !activeRunStatuses.has(updated.status)) {
+      await loadTestRuns()
+      showNotice(
+        updated.status === 'completed' ? 'success' : 'error',
+        updated.status === 'completed'
+          ? `“${updated.bank_name}”测试已完成`
+          : `“${updated.bank_name}”测试已结束：${testRunStatusLabel(updated.status)}`,
+      )
+    }
+  } catch (error) {
+    testError.value = messageOf(error)
+  } finally {
+    scheduleTestRunPoll()
   }
 }
 
@@ -207,12 +246,44 @@ async function startBankTest() {
   try {
     activeTestRun.value = await createTestRun(selectedTestBankId.value, selectedTestKnowledgeBaseId.value)
     await loadTestRuns()
-    showNotice('success', `“${activeTestRun.value.bank_name}”测试已完成`)
+    showNotice('success', `“${activeTestRun.value.bank_name}”已进入后台队列`)
+    scheduleTestRunPoll()
   } catch (error) {
     testError.value = messageOf(error)
   } finally {
     runningTest.value = false
   }
+}
+
+async function cancelActiveTestRun() {
+  if (!activeTestRun.value || !activeRunStatuses.has(activeTestRun.value.status)) return
+  try {
+    activeTestRun.value = await cancelTestRun(activeTestRun.value.id)
+    await loadTestRuns()
+    showNotice('success', '已提交取消请求')
+    scheduleTestRunPoll()
+  } catch (error) {
+    testError.value = messageOf(error)
+  }
+}
+
+async function retryActiveTestRun() {
+  if (!activeTestRun.value) return
+  try {
+    activeTestRun.value = await retryTestRun(activeTestRun.value.id)
+    await loadTestRuns()
+    showNotice('success', '失败题目已重新进入后台队列')
+    scheduleTestRunPoll()
+  } catch (error) {
+    testError.value = messageOf(error)
+  }
+}
+
+function testRunStatusLabel(status: string) {
+  return ({
+    queued: '排队中', running: '执行中', cancelling: '正在取消', cancelled: '已取消',
+    completed: '已完成', partial: '部分失败', failed: '失败',
+  } as Record<string, string>)[status] || status
 }
 
 async function loadCatalog() {
@@ -289,6 +360,35 @@ async function handleCreateBank() {
     showNotice('error', messageOf(error))
   } finally {
     savingBank.value = false
+  }
+}
+
+function openDescriptionDialog() {
+  if (!selectedBank.value) return
+  bankDescription.value = selectedBank.value.description || ''
+  descriptionError.value = ''
+  showDescriptionDialog.value = true
+}
+
+async function saveBankDescription() {
+  const bankId = selectedBank.value?.id
+  if (!bankId || savingDescription.value) return
+  savingDescription.value = true
+  descriptionError.value = ''
+  try {
+    const updated = await updateQuestionBank(bankId, {
+      description: bankDescription.value.trim() || null,
+    })
+    if (selectedBank.value?.id === bankId) selectedBank.value = updated
+    banks.value = banks.value.map((bank) => bank.id === bankId
+      ? { ...bank, description: updated.description, updated_at: updated.updated_at }
+      : bank)
+    showDescriptionDialog.value = false
+    showNotice('success', updated.description ? '题库介绍已保存' : '题库介绍已清除')
+  } catch (error) {
+    descriptionError.value = messageOf(error)
+  } finally {
+    savingDescription.value = false
   }
 }
 
@@ -418,6 +518,11 @@ function typeLabel(type: QuestionType) {
   return type === 'qa' ? '问答题' : '单选题'
 }
 
+function questionSourceLabel(question: StoredQuestion) {
+  if (question.metadata.import_file) return '测试集导入'
+  return question.source === 'generated' ? '分块生成' : '手工录入'
+}
+
 function testResultLabel(result: TestQuestionResult) {
   if (result.status !== 'completed') return '本题调用失败'
   const answer = result.metrics.answer as {
@@ -463,6 +568,7 @@ onMounted(async () => {
 onBeforeUnmount(() => {
   window.removeEventListener('hashchange', syncHash)
   if (noticeTimer) clearTimeout(noticeTimer)
+  if (testRunPollTimer) clearTimeout(testRunPollTimer)
 })
 </script>
 
@@ -525,7 +631,7 @@ onBeforeUnmount(() => {
               <span class="bank-spine" :class="`tone-${index % 4}`"></span>
               <span class="bank-card-head"><small>QB / {{ String(index + 1).padStart(2, '0') }}</small><i>→</i></span>
               <strong>{{ bank.name }}</strong>
-              <p>{{ bank.description || '尚未填写题库说明。' }}</p>
+              <p>{{ bank.description || '暂无题库介绍。' }}</p>
               <span class="bank-count"><b>{{ bank.question_count }}</b> 道题</span>
               <span class="bank-breakdown"><i>{{ bank.qa_count }} 问答</i><i>{{ bank.choice_count }} 选择</i></span>
               <time>更新于 {{ formatDate(bank.updated_at) }}</time>
@@ -541,7 +647,7 @@ onBeforeUnmount(() => {
           <div v-if="loadingBank" class="bank-detail-skeleton"></div>
           <template v-else-if="selectedBank">
             <div class="bank-hero">
-              <div><span class="eyebrow">Question bank / v{{ selectedBank.version }}</span><h1>{{ selectedBank.name }}</h1><p>{{ selectedBank.description || '尚未填写题库说明。' }}</p></div>
+              <div><span class="eyebrow">Question bank / v{{ selectedBank.version }}</span><h1>{{ selectedBank.name }}</h1><p class="bank-description">{{ selectedBank.description || '暂无题库介绍。' }}</p><button class="bank-description-edit" type="button" @click="openDescriptionDialog">{{ selectedBank.description ? '编辑介绍' : '设置介绍' }}</button></div>
               <div class="hero-actions"><button class="secondary-button" type="button" @click="navigate('generate')">从分块生成</button><button class="primary-button" type="button" @click="openCreateQuestion(selectedBank.id)">＋ 添加题目</button></div>
             </div>
             <div class="bank-summary">
@@ -557,12 +663,13 @@ onBeforeUnmount(() => {
                 <button class="question-row" type="button" @click="toggleQuestion(question.id)">
                   <span class="question-number">{{ String(index + 1).padStart(2, '0') }}</span>
                   <span class="type-badge" :class="question.question_type">{{ typeLabel(question.question_type) }}</span>
-                  <span class="question-copy"><b>{{ question.prompt }}</b><small>{{ question.source === 'generated' ? '分块生成' : '手工录入' }} · {{ formatDate(question.created_at) }}</small></span>
+                  <span class="question-copy"><b>{{ question.prompt }}</b><small>{{ questionSourceLabel(question) }} · {{ formatDate(question.created_at) }}</small></span>
                   <span class="row-arrow">⌄</span>
                 </button>
                 <div v-if="openQuestionIds.has(question.id)" class="question-detail">
                   <div v-if="question.options.length" class="option-list"><span v-for="option in question.options" :key="option.key" :class="{ correct: option.key === question.correct_answer }"><b>{{ option.key }}</b>{{ option.text }}</span></div>
-                  <div class="answer-panel"><small>标准答案</small><p>{{ question.standard_answer }}</p></div>
+                  <div class="answer-panel"><small>标准答案</small><p>{{ question.standard_answer || '原题未提供独立标准答案。' }}</p></div>
+                  <QuestionEvidence :evidence="question.evidence" :metadata="question.metadata" />
                 </div>
               </article>
             </div>
@@ -587,12 +694,13 @@ onBeforeUnmount(() => {
               <button class="question-row" type="button" @click="toggleQuestion(question.id)">
                 <span class="question-number">{{ String(index + 1).padStart(2, '0') }}</span>
                 <span class="type-badge" :class="question.question_type">{{ typeLabel(question.question_type) }}</span>
-                <span class="question-copy"><b>{{ question.prompt }}</b><small>{{ question.bank_name }} · {{ question.source === 'generated' ? '分块生成' : '手工录入' }}</small></span>
+                <span class="question-copy"><b>{{ question.prompt }}</b><small>{{ question.bank_name }} · {{ questionSourceLabel(question) }}</small></span>
                 <span class="row-arrow">⌄</span>
               </button>
               <div v-if="openQuestionIds.has(question.id)" class="question-detail">
                 <div v-if="question.options.length" class="option-list"><span v-for="option in question.options" :key="option.key" :class="{ correct: option.key === question.correct_answer }"><b>{{ option.key }}</b>{{ option.text }}</span></div>
-                <div class="answer-panel"><small>标准答案</small><p>{{ question.standard_answer }}</p></div>
+                <div class="answer-panel"><small>标准答案</small><p>{{ question.standard_answer || '原题未提供独立标准答案。' }}</p></div>
+                <QuestionEvidence :evidence="question.evidence" :metadata="question.metadata" />
                 <div v-if="question.metadata.topic" class="meta-strip"><span>主题：{{ question.metadata.topic }}</span><span>口吻：{{ styleLabel(question.metadata.question_style) }}</span><span>难度：{{ question.metadata.difficulty || '未指定' }}</span></div>
               </div>
             </article>
@@ -609,7 +717,7 @@ onBeforeUnmount(() => {
               <label><span>题库</span><select v-model="selectedTestBankId" :disabled="!banks.length || runningTest"><option v-if="!banks.length" value="">暂无题库</option><option v-for="bank in banks" :key="bank.id" :value="bank.id">{{ bank.name }}</option></select></label>
               <label><span>知识库</span><select v-model="selectedTestKnowledgeBaseId" :disabled="!knowledgeBases.length || loadingCatalog || runningTest"><option v-if="loadingCatalog" value="">正在加载知识库…</option><option v-else-if="!knowledgeBases.length" value="">暂无知识库</option><option v-for="item in knowledgeBases" :key="item.id" :value="item.id">{{ item.name }}</option></select></label>
               <div class="test-bank-stats"><span><b>{{ selectedTestBank?.question_count || 0 }}</b> 道题目</span><span><b>{{ selectedTestBank?.qa_count || 0 }}</b> 问答</span><span><b>{{ selectedTestBank?.choice_count || 0 }}</b> 单选</span></div>
-              <button class="primary-button" type="button" :disabled="!selectedTestBank?.question_count || !selectedTestKnowledgeBaseId || loadingCatalog || runningTest" @click="startBankTest">{{ runningTest ? '正在逐题调用 Agent…' : '开始测试题库' }}</button>
+              <button class="primary-button" type="button" :disabled="!selectedTestBank?.question_count || !selectedTestKnowledgeBaseId || loadingCatalog || runningTest" @click="startBankTest">{{ runningTest ? '正在创建后台任务…' : '开始测试题库' }}</button>
             </div>
             <p v-if="!banks.length" class="test-help">请先创建题库并加入题目，再开始测试。</p>
             <p v-else-if="!selectedTestBank?.question_count" class="test-help">当前题库没有题目，无法开始测试。</p>
@@ -621,12 +729,15 @@ onBeforeUnmount(() => {
 
           <section v-if="activeTestRun" class="test-results">
             <div class="section-line"><h2>测试结果 · {{ activeTestRun.bank_name }}</h2><span>{{ activeTestRun.completed_questions }} / {{ activeTestRun.total_questions }} 道已完成</span></div>
-            <div class="test-run-summary"><span>状态：{{ activeTestRun.status === 'completed' ? '已完成' : activeTestRun.status === 'partial' ? '部分失败' : '失败' }}</span><span>开始于 {{ formatDate(activeTestRun.started_at) }}</span></div>
+            <div class="test-run-summary"><span>状态：{{ testRunStatusLabel(activeTestRun.status) }}</span><span>开始于 {{ formatDate(activeTestRun.started_at) }}</span><span v-if="activeTestRun.attempt_count">Worker 尝试 {{ activeTestRun.attempt_count }} 次</span><button v-if="activeRunStatuses.has(activeTestRun.status)" class="text-action" type="button" @click="cancelActiveTestRun">取消测试</button><button v-else-if="['partial', 'failed', 'cancelled'].includes(activeTestRun.status)" class="text-action" type="button" @click="retryActiveTestRun">重试未完成题目</button></div>
+            <progress v-if="activeRunStatuses.has(activeTestRun.status)" class="test-run-progress" :max="activeTestRun.total_questions" :value="activeTestRun.completed_questions">{{ activeTestRun.completed_questions }} / {{ activeTestRun.total_questions }}</progress>
+            <p v-if="activeTestRun.error" class="test-result-error">{{ activeTestRun.error }}</p>
             <div class="question-list test-result-list">
               <article v-for="(result, index) in activeTestRun.results" :key="result.id">
                 <div class="test-result-row"><span class="question-number">{{ String(index + 1).padStart(2, '0') }}</span><span class="test-result-copy"><span class="test-result-question-heading"><i class="type-badge" :class="result.question_type">{{ typeLabel(result.question_type) }}</i><b>{{ result.prompt }}</b></span><small>{{ testResultLabel(result) }}</small></span><span v-if="result.overall_score != null" class="test-score"><small>综合</small>{{ Math.round(result.overall_score * 100) }}%</span></div>
                 <div v-if="result.question_type === 'single_choice' && result.options.length" class="test-result-options option-list"><span v-for="option in result.options" :key="option.key" :class="{ correct: option.key === result.correct_answer, chosen: option.key === selectedOptionFor(result) }"><b>{{ option.key }}</b>{{ option.text }}<small v-if="option.key === result.correct_answer">正确答案</small><small v-if="option.key === selectedOptionFor(result)">Agent 选择</small></span></div>
                 <div v-if="result.answer" class="test-answer"><small>{{ result.question_type === 'single_choice' ? 'Agent 作答说明' : 'Agent 回答' }}</small><p>{{ result.answer }}</p></div>
+                <RetrievalComparison :evaluation="result.metrics.retrieval" />
                 <p v-if="result.error" class="test-result-error">{{ result.error }}</p>
               </article>
             </div>
@@ -637,7 +748,7 @@ onBeforeUnmount(() => {
             <div v-if="loadingTestRuns" class="list-loading">正在读取测试记录…</div>
             <div v-else-if="!testRuns.length" class="empty-list"><b>还没有测试记录</b><span>选择一个包含题目的题库，开始第一次测试。</span></div>
             <div v-else class="test-history-list">
-              <button v-for="run in testRuns" :key="run.id" type="button" :class="{ active: activeTestRun?.id === run.id }" @click="openTestRun(run.id)"><span><b>{{ run.bank_name }}</b><small>{{ formatDate(run.started_at) }} · {{ run.completed_questions }}/{{ run.total_questions }} 道已完成</small></span><i>{{ run.status === 'completed' ? '已完成' : run.status === 'partial' ? '部分失败' : run.status === 'failed' ? '失败' : run.status }}</i></button>
+              <button v-for="run in testRuns" :key="run.id" type="button" :class="{ active: activeTestRun?.id === run.id }" @click="openTestRun(run.id)"><span><b>{{ run.bank_name }}</b><small>{{ formatDate(run.started_at) }} · {{ run.completed_questions }}/{{ run.total_questions }} 道已完成</small></span><i>{{ testRunStatusLabel(run.status) }}</i></button>
             </div>
           </section>
         </section>
@@ -704,8 +815,18 @@ onBeforeUnmount(() => {
       <form class="dialog" @submit.prevent="handleCreateBank">
         <div class="dialog-head"><div><span class="eyebrow">New question bank</span><h2>创建题库</h2><p>为一组同主题评测题建立独立容器。</p></div><button type="button" aria-label="关闭" @click="showBankDialog = false">×</button></div>
         <label><span>题库名称 <b>*</b></span><input v-model.trim="bankForm.name" required maxlength="500" autofocus placeholder="如：脑出血急性期处置题库"></label>
-        <label><span>题库说明</span><textarea v-model.trim="bankForm.description" rows="4" maxlength="4000" placeholder="说明适用范围、评测对象或维护约定"></textarea></label>
+        <label><span>题库介绍</span><textarea v-model.trim="bankForm.description" rows="4" maxlength="4000" placeholder="介绍题库主题、适用范围或评测目标"></textarea></label>
         <div class="dialog-actions"><button class="secondary-button" type="button" @click="showBankDialog = false">取消</button><button class="primary-button" type="submit" :disabled="savingBank || !bankForm.name">{{ savingBank ? '正在创建…' : '创建题库' }}</button></div>
+      </form>
+    </div>
+
+    <div v-if="showDescriptionDialog" class="dialog-backdrop" role="dialog" aria-modal="true" aria-labelledby="description-dialog-title" @click.self="!savingDescription && (showDescriptionDialog = false)" @keydown.esc="!savingDescription && (showDescriptionDialog = false)">
+      <form class="dialog" @submit.prevent="saveBankDescription">
+        <div class="dialog-head"><div><h2 id="description-dialog-title">编辑题库介绍</h2><p>{{ selectedBank?.name }}</p></div><button type="button" aria-label="关闭" :disabled="savingDescription" @click="showDescriptionDialog = false">×</button></div>
+        <label><span>题库介绍</span><textarea v-model="bankDescription" rows="5" maxlength="4000" :disabled="savingDescription" placeholder="介绍题库主题、适用范围或评测目标"></textarea></label>
+        <p class="description-help">留空并保存可清除介绍。{{ bankDescription.length }} / 4000</p>
+        <div v-if="descriptionError" class="inline-error" role="alert">{{ descriptionError }}</div>
+        <div class="dialog-actions"><button class="secondary-button" type="button" :disabled="savingDescription" @click="showDescriptionDialog = false">取消</button><button class="primary-button" type="submit" :disabled="savingDescription">{{ savingDescription ? '正在保存…' : '保存介绍' }}</button></div>
       </form>
     </div>
 

@@ -1,5 +1,7 @@
+import asyncio
 from datetime import UTC, datetime
 from typing import ClassVar
+from unittest.mock import AsyncMock
 from uuid import uuid4
 
 from fastapi.testclient import TestClient
@@ -9,6 +11,8 @@ from evaluation_api.db import get_db
 from evaluation_api.main import app
 from evaluation_api.models import Dataset, EvaluationResult, EvaluationRun, Question
 from evaluation_api.services.platform_client import get_platform_client
+from evaluation_api.services.run_queue import get_run_queue
+from evaluation_api.services.test_run_execution import execute_evaluation_run
 
 
 class FakeScalars:
@@ -17,6 +21,9 @@ class FakeScalars:
 
     def all(self):
         return self.items
+
+    def __iter__(self):
+        return iter(self.items)
 
 
 class FakeRows:
@@ -31,7 +38,6 @@ class FakeDatabase:
     def __init__(self, bank, questions):
         self.bank = bank
         self.questions = questions
-        self.results = []
 
     async def get(self, model, _bank_id):
         return self.bank if model is Dataset else None
@@ -43,9 +49,10 @@ class FakeDatabase:
         if isinstance(item, EvaluationRun):
             item.id = uuid4()
             item.started_at = datetime.now(UTC)
-        elif isinstance(item, EvaluationResult):
-            item.id = uuid4()
-            self.results.append(item)
+            item.attempt_count = 0
+            item.cancel_requested = False
+            item.error = None
+            item.finished_at = None
 
     async def commit(self):
         return None
@@ -54,18 +61,7 @@ class FakeDatabase:
         return None
 
     async def execute(self, _statement):
-        return FakeRows(
-            [
-                (
-                    item,
-                    question.prompt,
-                    question.question_type,
-                    question.options,
-                    question.correct_answer,
-                )
-                for item, question in zip(self.results, self.questions)
-            ]
-        )
+        return FakeRows([])
 
 
 class FakeAgent:
@@ -83,7 +79,22 @@ class FakeAgent:
             "run_id": f"agent-{len(content)}",
             "content": answer,
             "citations": [],
+            "tool_calls": [{
+                "tool": "search_medical_knowledge", "is_error": False,
+                "result": {"items": [
+                    {"chunk_id": "unrelated", "content": "与题目无关的内容"},
+                    {"chunk_id": "matched", "content": "患者应尽快完成头颅 CT 检查。"},
+                ]},
+            }],
         }
+
+
+class FakeQueue:
+    enqueued: ClassVar[list] = []
+
+    async def enqueue(self, run_id):
+        type(self).enqueued.append(run_id)
+        return f"task-{run_id}"
 
 
 def fake_db_provider(database):
@@ -93,20 +104,18 @@ def fake_db_provider(database):
     return provider
 
 
-def test_run_question_bank_persists_each_agent_result() -> None:
-    bank_id = uuid4()
-    bank = Dataset(id=bank_id, name="测试题库", version="1.0", description=None)
-    questions = [
+def questions_for(bank_id):
+    return [
         Question(
             id=uuid4(),
             dataset_id=bank_id,
             prompt="问答：脑出血首选什么检查？",
-            gold_answer="应尽快完成头颅 CT 检查。",
+            gold_answer="",
             question_type="qa",
             options=[],
             correct_answer=None,
             metadata_json={},
-            gold_evidence=[],
+            gold_evidence=[{"quote": "患者应尽快完成头颅 CT 检查。"}],
             source="manual",
         ),
         Question(
@@ -122,11 +131,17 @@ def test_run_question_bank_persists_each_agent_result() -> None:
             source="manual",
         ),
     ]
-    database = FakeDatabase(bank, questions)
-    FakeAgent.seen_collection_ids.clear()
+
+
+def test_create_run_returns_queued_and_dispatches_without_calling_agent() -> None:
+    bank_id = uuid4()
+    bank = Dataset(id=bank_id, name="测试题库", version="1.0", description=None)
+    database = FakeDatabase(bank, questions_for(bank_id))
+    FakeQueue.enqueued.clear()
     FakeAgent.seen_prompts.clear()
     app.dependency_overrides[get_db] = fake_db_provider(database)
     app.dependency_overrides[get_platform_client] = FakeAgent
+    app.dependency_overrides[get_run_queue] = FakeQueue
     try:
         with TestClient(app) as client:
             response = client.post(
@@ -136,24 +151,97 @@ def test_run_question_bank_persists_each_agent_result() -> None:
                     "collection_id": "78cff297-3d57-4135-8c34-eba69a6d24a2",
                 },
             )
-        assert response.status_code == 201, response.text
+        assert response.status_code == 202, response.text
         payload = response.json()
-        assert payload["bank_name"] == "测试题库"
-        assert payload["status"] == "completed"
-        assert payload["total_questions"] == payload["completed_questions"] == 2
-        assert len(payload["results"]) == 2
-        assert payload["results"][0]["question_type"] == "qa"
-        assert payload["results"][1]["question_type"] == "single_choice"
-        assert payload["results"][1]["correct_answer"] == "B"
-        assert payload["results"][1]["options"][1]["key"] == "B"
-        assert payload["results"][1]["metrics"]["answer"]["metrics"]["choice_accuracy"] == 1.0
-        assert FakeAgent.seen_collection_ids == ["78cff297-3d57-4135-8c34-eba69a6d24a2"] * 2
-        assert FakeAgent.seen_prompts[0].startswith("这是一道问答题")
-        assert "这是一道单选题" in FakeAgent.seen_prompts[1]
-        assert "A. 血常规" in FakeAgent.seen_prompts[1]
-        assert "B. 头颅 CT" in FakeAgent.seen_prompts[1]
+        assert payload["status"] == "queued"
+        assert payload["total_questions"] == 2
+        assert payload["completed_questions"] == 0
+        assert payload["results"] == []
+        assert [str(item) for item in FakeQueue.enqueued] == [payload["id"]]
+        assert FakeAgent.seen_prompts == []
     finally:
         app.dependency_overrides.clear()
+
+
+class RunnerRows:
+    def __init__(self, first_value):
+        self.first_value = first_value
+
+    def first(self):
+        return self.first_value
+
+
+class RunnerSession:
+    def __init__(self, run, bank, questions):
+        self.run = run
+        self.bank = bank
+        self.questions = questions
+        self.added = []
+        self.execute = AsyncMock(return_value=RunnerRows((run, bank)))
+        self.commit = AsyncMock()
+        self.refresh = AsyncMock()
+        self._scalar_calls = 0
+
+    async def scalars(self, _statement):
+        self._scalar_calls += 1
+        if self._scalar_calls == 1:
+            return FakeScalars(self.questions)
+        if self._scalar_calls == 2:
+            return FakeScalars([self.questions[0].id])
+        return FakeScalars(["completed", "completed"])
+
+    def add(self, item):
+        self.added.append(item)
+
+
+class RunnerSessionContext:
+    def __init__(self, session):
+        self.session = session
+
+    async def __aenter__(self):
+        return self.session
+
+    async def __aexit__(self, *_args):
+        return None
+
+
+def test_worker_resumes_from_persisted_question_results() -> None:
+    bank_id = uuid4()
+    run_id = uuid4()
+    bank = Dataset(id=bank_id, name="测试题库", version="1.0", description=None)
+    questions = questions_for(bank_id)
+    run = EvaluationRun(
+        id=run_id,
+        dataset_id=bank_id,
+        status="queued",
+        config={"collection_id": "78cff297-3d57-4135-8c34-eba69a6d24a2", "scoring_top_k": 5},
+        total_questions=2,
+        completed_questions=1,
+        attempt_count=0,
+        cancel_requested=False,
+        worker_task_id=None,
+        heartbeat_at=None,
+        last_enqueued_at=None,
+        error=None,
+    )
+    session = RunnerSession(run, bank, questions)
+    FakeAgent.seen_prompts.clear()
+    asyncio.run(
+        execute_evaluation_run(
+            run_id,
+            "worker-task-2",
+            session_factory=lambda: RunnerSessionContext(session),
+            client=FakeAgent(),
+        )
+    )
+    added = [item for item in session.added if isinstance(item, EvaluationResult)]
+    assert len(added) == 1
+    assert added[0].question_id == questions[1].id
+    assert run.completed_questions == 2
+    assert run.status == "completed"
+    assert run.attempt_count == 1
+    assert len(FakeAgent.seen_prompts) == 1
+    assert "这是一道单选题" in FakeAgent.seen_prompts[0]
 
 
 def test_choice_score_recognizes_answer_key() -> None:

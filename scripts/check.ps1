@@ -1,6 +1,7 @@
 [CmdletBinding()]
 param(
-    [switch]$SkipInstall
+    [switch]$SkipInstall,
+    [switch]$SkipE2E
 )
 
 $ErrorActionPreference = 'Stop'
@@ -41,6 +42,10 @@ try {
     Invoke-Checked '前端生产构建' { npm run build }
     Invoke-Checked '前端单元测试' { npm run test:web }
     Invoke-Checked 'Compose 配置校验' { docker compose -f infra/platform/compose.yaml config --quiet }
+    Invoke-Checked 'E2E Compose 配置校验' { docker compose -f infra/platform/compose.e2e.yaml config --quiet }
+    if (-not $SkipE2E) {
+        Invoke-Checked 'Playwright 验收测试' { & (Join-Path $root 'scripts/e2e.ps1') }
+    }
 
     Write-Host "`n全部单仓校验通过。" -ForegroundColor Green
 } finally {

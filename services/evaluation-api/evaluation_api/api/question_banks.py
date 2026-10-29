@@ -14,6 +14,7 @@ from evaluation_api.schemas.question_bank import (
     QuestionBankCreate,
     QuestionBankDetail,
     QuestionBankSummary,
+    QuestionBankUpdate,
     QuestionBulkCreate,
     QuestionCreate,
     QuestionResponse,
@@ -132,6 +133,18 @@ async def get_question_bank(bank_id: UUID, db: DbSession) -> QuestionBankDetail:
         updated_at=bank.updated_at,
         questions=responses,
     )
+
+
+@router.patch("/question-banks/{bank_id}", response_model=QuestionBankDetail)
+async def update_question_bank(
+    bank_id: UUID, payload: QuestionBankUpdate, db: DbSession
+) -> QuestionBankDetail:
+    bank = await _get_bank_or_404(db, bank_id)
+    bank.description = (payload.description or "").strip() or None
+    bank.updated_at = func.now()
+    await db.commit()
+    await db.refresh(bank)
+    return await get_question_bank(bank_id, db)
 
 
 @router.get("/questions", response_model=list[QuestionResponse])

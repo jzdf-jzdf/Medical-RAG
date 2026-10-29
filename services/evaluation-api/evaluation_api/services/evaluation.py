@@ -3,10 +3,100 @@
 from __future__ import annotations
 
 import re
+import unicodedata
+from collections import Counter
 from statistics import mean
 from typing import Any
 
 CITATION_RE = re.compile(r"(?<![A-Za-z0-9_])\[(\d+)\]")
+
+
+def _chunk_text(chunk: str | dict[str, Any]) -> str:
+    if isinstance(chunk, str):
+        return chunk
+    for key in ("quote", "content", "text", "context"):
+        value = chunk.get(key)
+        if isinstance(value, str) and value.strip():
+            return value
+    return ""
+
+
+def _text_bigrams(text: str) -> Counter[str]:
+    value = unicodedata.normalize("NFKC", text).casefold()
+    value = value.replace("≥", ">=").replace("≤", "<=")
+    value = value.translate(str.maketrans({"–": "-", "—": "-", "~": "-"}))
+    value = "".join(value.split())
+    # Preserve decimal points, percentages and comparisons so 1.5 and 15 differ.
+    value = "".join(
+        char for index, char in enumerate(value)
+        if char.isalnum() or char in "%<>=±+-"
+        or (
+            char == "." and 0 < index < len(value) - 1
+            and value[index - 1].isdigit() and value[index + 1].isdigit()
+        )
+    )
+    if len(value) < 2:
+        return Counter([value]) if value else Counter()
+    return Counter(value[index:index + 2] for index in range(len(value) - 1))
+
+
+def evaluate_reference_text(
+    retrieved_chunks: list[dict[str, Any]],
+    reference_chunks: list[str | dict[str, Any]],
+    top_k: int,
+) -> dict[str, Any] | None:
+    references = [(_chunk_text(chunk), _text_bigrams(_chunk_text(chunk)))
+                  for chunk in reference_chunks]
+    references = [(text, tokens) for text, tokens in references if tokens]
+    if not references:
+        return None
+    candidates = [
+        (rank, chunk, _chunk_text(chunk), _text_bigrams(_chunk_text(chunk)))
+        for rank, chunk in enumerate(retrieved_chunks[:top_k], start=1)
+    ]
+    candidates = [candidate for candidate in candidates if candidate[3]]
+    matches = []
+    for index, (reference, reference_tokens) in enumerate(references, start=1):
+        best: dict[str, Any] = {
+            "reference_index": index,
+            "reference_text": reference,
+            "retrieved_rank": None,
+            "retrieved_text": "",
+            "document_id": None,
+            "chunk_id": None,
+            "title": None,
+            "recall": 0.0,
+            "precision": 0.0,
+            "f1": 0.0,
+        }
+        for rank, chunk, retrieved, retrieved_tokens in candidates:
+            overlap = sum((reference_tokens & retrieved_tokens).values())
+            recall = overlap / reference_tokens.total()
+            precision = overlap / retrieved_tokens.total()
+            f1 = 2 * recall * precision / (recall + precision) if recall + precision else 0.0
+            if (recall, f1) > (best["recall"], best["f1"]):
+                best.update(
+                    retrieved_rank=rank, retrieved_text=retrieved,
+                    document_id=chunk.get("document_id"), chunk_id=chunk.get("chunk_id"),
+                    title=chunk.get("title") or chunk.get("document_title"),
+                    recall=recall, precision=precision, f1=f1,
+                )
+        matches.append(best)
+    metrics = {
+        "k": top_k,
+        "reference_count": len(references),
+        "retrieved_count": len(retrieved_chunks[:top_k]),
+        "text_recall": mean(match["recall"] for match in matches),
+        "text_precision": mean(match["precision"] for match in matches),
+        "text_f1": mean(match["f1"] for match in matches),
+    }
+    return {
+        "method": "reference_text_v1",
+        "score": metrics["text_recall"],
+        "metrics": metrics,
+        "matches": matches,
+        "issues": [] if candidates else ["no_retrieved_text"],
+    }
 
 
 def _tokens(value: str) -> set[str]:
@@ -22,13 +112,18 @@ def _tokens(value: str) -> set[str]:
 
 
 def evaluate_retrieval(
-    citations: list[dict[str, Any]], expected_document_ids: list[str], top_k: int
+    citations: list[dict[str, Any]], expected_document_ids: list[str], top_k: int,
+    reference_chunks: list[str | dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
+    text_score = evaluate_reference_text(citations, reference_chunks or [], top_k)
+    if text_score is not None:
+        return text_score
     retrieved = [str(item.get("document_id") or "") for item in citations[:top_k]]
     expected = set(expected_document_ids)
     rank = next((index for index, value in enumerate(retrieved, start=1) if value in expected), None)
     if not expected:
         return {
+            "method": "document_id",
             "score": None,
             "metrics": {"hit_at_k": None, "recall_at_k": None, "mrr_at_k": None, "k": top_k},
             "issues": ["missing_retrieval_labels"],
@@ -39,7 +134,7 @@ def evaluate_retrieval(
         "mrr_at_k": 1 / rank if rank else 0.0,
         "k": top_k,
     }
-    return {"score": mean(metrics[key] for key in ("hit_at_k", "recall_at_k", "mrr_at_k")), "metrics": metrics, "issues": []}
+    return {"method": "document_id", "score": mean(metrics[key] for key in ("hit_at_k", "recall_at_k", "mrr_at_k")), "metrics": metrics, "issues": []}
 
 
 def evaluate_citations(answer: str, citations: list[dict[str, Any]]) -> dict[str, Any]:
@@ -113,8 +208,13 @@ def evaluate_layers(
     expected_document_ids: list[str],
     reference_answer: str | None,
     top_k: int,
+    reference_chunks: list[str | dict[str, Any]] | None = None,
+    retrieved_chunks: list[dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
-    retrieval = evaluate_retrieval(citations, expected_document_ids, top_k)
+    retrieval = evaluate_retrieval(
+        citations if retrieved_chunks is None else retrieved_chunks,
+        expected_document_ids, top_k, reference_chunks,
+    )
     citation = evaluate_citations(answer, citations)
     answer_score = evaluate_answer(answer, reference_answer)
     available = [

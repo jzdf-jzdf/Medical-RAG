@@ -125,8 +125,35 @@ services:
       AGENT_API_URL: http://agent-api:8002
       ALLOWED_ORIGINS: '["http://localhost:8080"]'
       REQUEST_TIMEOUT_SECONDS: ${EVALUATION_REQUEST_TIMEOUT_SECONDS:-300}
+      EVALUATION_DISPATCHER_ENABLED: "true"
     depends_on:
       evaluation-db:
+        condition: service_healthy
+      redis:
+        condition: service_started
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8003/ready')"]
+      interval: 5s
+      timeout: 3s
+      retries: 30
+
+  evaluation-worker:
+    build:
+      context: ../..
+      dockerfile: services/evaluation-api/Dockerfile
+    command: ["celery", "-A", "evaluation_api.celery_app:celery_app", "worker", "--loglevel=INFO", "--concurrency=1"]
+    environment:
+      APP_ENV: development
+      DATABASE_URL: postgresql+asyncpg://evaluation:evaluation@evaluation-db:5432/evaluation_db
+      REDIS_URL: redis://redis:6379/0
+      KNOWLEDGE_API_URL: http://knowledge-api:8001
+      AGENT_API_URL: http://agent-api:8002
+      REQUEST_TIMEOUT_SECONDS: ${EVALUATION_REQUEST_TIMEOUT_SECONDS:-300}
+      EVALUATION_DISPATCHER_ENABLED: "false"
+      EVALUATION_STALE_SECONDS: ${EVALUATION_STALE_SECONDS:-900}
+      EVALUATION_TASK_MAX_RETRIES: ${EVALUATION_TASK_MAX_RETRIES:-3}
+    depends_on:
+      evaluation-api:
         condition: service_healthy
       redis:
         condition: service_started

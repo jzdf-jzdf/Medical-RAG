@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import json
 import re
+import unicodedata
 from typing import Any
 
 import httpx
@@ -118,6 +119,53 @@ class PlatformClient:
 
 def get_platform_client() -> PlatformClient:
     return PlatformClient(get_settings())
+
+
+def extract_retrieved_chunks(result: dict[str, Any]) -> tuple[list[dict[str, Any]], str]:
+    """Keep all successful search results, including evidence absent from final citations."""
+    calls = result.get("tool_calls")
+    searches = [
+        call for call in calls if isinstance(call, dict)
+        and call.get("tool") in {"search_medical_knowledge", "hybrid_search"}
+    ] if isinstance(calls, list) else []
+    if not searches:
+        citations = result.get("citations")
+        return (
+            [item for item in citations if isinstance(item, dict)]
+            if isinstance(citations, list) else [],
+            "citations",
+        )
+    chunks: list[dict[str, Any]] = []
+    seen: set[tuple[str, ...]] = set()
+    for call in searches:
+        if call.get("is_error") or call.get("status") == "failed":
+            continue
+        payload = call.get("result")
+        items = payload.get("items") if isinstance(payload, dict) else None
+        if not isinstance(items, list):
+            continue
+        for item in items:
+            if not isinstance(item, dict):
+                continue
+            text = item.get("content") or item.get("text") or ""
+            if not isinstance(text, str):
+                text = ""
+            chunk_id = str(item.get("chunk_id") or "")
+            normalized_text = "".join(unicodedata.normalize("NFKC", text).casefold().split())
+            key = (
+                ("chunk", str(item.get("document_id") or ""), chunk_id)
+                if chunk_id else ("text", normalized_text)
+            )
+            if key in seen:
+                continue
+            seen.add(key)
+            chunks.append({
+                "document_id": item.get("document_id"),
+                "chunk_id": item.get("chunk_id"),
+                "title": item.get("document_title") or item.get("title"),
+                "text": text,
+            })
+    return chunks, "tool_calls"
 
 
 def build_question_prompt(

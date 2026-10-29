@@ -11,13 +11,31 @@ class EvaluationRequest(BaseModel):
     citations: list[dict[str, Any]] = Field(default_factory=list)
     expected_document_ids: list[str] = Field(default_factory=list)
     reference_answer: str | None = None
+    reference_chunks: list[str | dict[str, Any]] = Field(default_factory=list)
+    retrieved_chunks: list[dict[str, Any]] | None = None
     top_k: int = Field(default=5, ge=1, le=50)
+
+
+class ReferenceTextMatch(BaseModel):
+    reference_index: int
+    reference_text: str
+    retrieved_rank: int | None
+    retrieved_text: str
+    document_id: str | None = None
+    chunk_id: str | None = None
+    title: str | None = None
+    recall: float
+    precision: float
+    f1: float
 
 
 class LayerScore(BaseModel):
     score: float | None
     metrics: dict[str, float | int | None]
     issues: list[str] = Field(default_factory=list)
+    method: str | None = None
+    source: str | None = None
+    matches: list[ReferenceTextMatch] = Field(default_factory=list)
 
 
 class EvaluationResponse(BaseModel):

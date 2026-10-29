@@ -1,0 +1,33 @@
+name: medical-rag-e2e
+
+services:
+  gateway:
+    image: nginx:1.27-alpine
+    ports: ["18080:8080"]
+    volumes:
+      - ./nginx.e2e.conf:/etc/nginx/nginx.conf:ro
+    depends_on: [knowledge-web, agent-web, evaluation-web]
+
+  knowledge-web:
+    build:
+      context: ../..
+      dockerfile: infra/docker/web.Dockerfile
+      args:
+        APP_NAME: knowledge-web
+        APP_BASE: knowledge
+
+  agent-web:
+    build:
+      context: ../..
+      dockerfile: infra/docker/web.Dockerfile
+      args:
+        APP_NAME: agent-web
+        APP_BASE: agent
+
+  evaluation-web:
+    build:
+      context: ../..
+      dockerfile: infra/docker/web.Dockerfile
+      args:
+        APP_NAME: evaluation-web
+        APP_BASE: evaluation

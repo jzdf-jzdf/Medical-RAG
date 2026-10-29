@@ -68,6 +68,10 @@ class QuestionBankCreate(BaseModel):
     description: str | None = Field(default=None, max_length=4000)
 
 
+class QuestionBankUpdate(BaseModel):
+    description: str | None = Field(max_length=4000)
+
+
 class QuestionBankSummary(BaseModel):
     id: UUID
     name: str

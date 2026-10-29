@@ -34,6 +34,9 @@ class TestRunSummary(BaseModel):
     status: str
     total_questions: int
     completed_questions: int
+    attempt_count: int = 0
+    cancel_requested: bool = False
+    error: str | None = None
     started_at: datetime
     finished_at: datetime | None = None
 

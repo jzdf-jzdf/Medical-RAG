@@ -16,6 +16,11 @@ class Settings(BaseSettings):
     allowed_origins: list[str] = ["http://localhost:5175"]
     request_timeout_seconds: int = Field(default=120, ge=1, le=600)
     evaluation_user_id: str = Field(default="evaluation-workbench", min_length=1)
+    evaluation_dispatcher_enabled: bool = True
+    evaluation_dispatch_interval_seconds: float = Field(default=5, ge=1, le=60)
+    evaluation_requeue_seconds: int = Field(default=300, ge=30, le=3600)
+    evaluation_stale_seconds: int = Field(default=900, ge=60, le=7200)
+    evaluation_task_max_retries: int = Field(default=3, ge=0, le=20)
 
     @field_validator("allowed_origins", mode="before")
     @classmethod

@@ -14,4 +14,6 @@ async def score(payload: EvaluationRequest) -> dict:
         expected_document_ids=payload.expected_document_ids,
         reference_answer=payload.reference_answer,
         top_k=payload.top_k,
+        reference_chunks=payload.reference_chunks,
+        retrieved_chunks=payload.retrieved_chunks,
     )

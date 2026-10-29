@@ -30,6 +30,10 @@ export const fetchQuestionBank = (id: string) =>
   request<QuestionBankDetail>(`/question-banks/${encodeURIComponent(id)}`)
 export const createQuestionBank = (payload: { name: string; description?: string }) =>
   request<QuestionBankSummary>('/question-banks', { method: 'POST', body: JSON.stringify(payload) })
+export const updateQuestionBank = (id: string, payload: { description: string | null }) =>
+  request<QuestionBankDetail>(`/question-banks/${encodeURIComponent(id)}`, {
+    method: 'PATCH', body: JSON.stringify(payload),
+  })
 
 export function fetchQuestions(filters?: { bankId?: string; type?: QuestionType; query?: string }) {
   const params = new URLSearchParams()
@@ -66,3 +70,7 @@ export const fetchTestRun = (id: string) => request<TestRunDetail>(`/test-runs/$
 export const createTestRun = (bankId: string, collectionId: string) => request<TestRunDetail>('/test-runs', {
   method: 'POST', body: JSON.stringify({ bank_id: bankId, collection_id: collectionId }),
 })
+export const cancelTestRun = (id: string) =>
+  request<TestRunDetail>(`/test-runs/${encodeURIComponent(id)}/cancel`, { method: 'POST' })
+export const retryTestRun = (id: string) =>
+  request<TestRunDetail>(`/test-runs/${encodeURIComponent(id)}/retry`, { method: 'POST' })

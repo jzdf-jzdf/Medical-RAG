@@ -50,6 +50,8 @@ docker compose -f .\infra\platform\compose.yaml up --build
 
 统一入口为 `http://localhost:8080`。
 
+题库测试由 `evaluation-worker` 后台执行；创建测试会立即返回队列状态，页面持续显示进度。Worker 异常退出后 Celery 会重新投递，执行器按已落库题目断点续跑。
+
 ## 日常开发
 
 ```powershell

@@ -1,12 +1,12 @@
-"""Run a saved question bank against the Agent and persist per-question scores."""
+"""Queue, inspect, cancel, and retry saved question-bank evaluations."""
 
-import re
 from datetime import UTC, datetime
 from typing import Annotated
 from uuid import UUID
 
+import structlog
 from fastapi import APIRouter, Depends, HTTPException, status
-from sqlalchemy import select
+from sqlalchemy import delete, func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from evaluation_api.db import get_db
@@ -17,48 +17,23 @@ from evaluation_api.schemas.test_runs import (
     TestRunDetail,
     TestRunSummary,
 )
-from evaluation_api.services.evaluation import evaluate_layers
 from evaluation_api.services.platform_client import (
     PlatformClient,
     PlatformServiceError,
     get_platform_client,
 )
+from evaluation_api.services.run_queue import EvaluationRunQueue, get_run_queue
+from evaluation_api.services.test_run_execution import agent_test_prompt, choice_score
 
 router = APIRouter(prefix="/test-runs", tags=["question-bank tests"])
 DbSession = Annotated[AsyncSession, Depends(get_db)]
 AgentClient = Annotated[PlatformClient, Depends(get_platform_client)]
+RunQueue = Annotated[EvaluationRunQueue, Depends(get_run_queue)]
+logger = structlog.get_logger(__name__)
 
-
-def _choice_score(answer: str, question: Question) -> tuple[float, str | None]:
-    clean_answer = re.sub(r"\[\d+\]", "", answer).strip().upper()
-    match = re.search(
-        r"(?:^|故选|应选|选项|答案|选择|选)(?:为|是)?\s*[:：]?\s*[（(\[]?([A-F])[）)\]]?"
-        r"(?:选项|项)?(?:$|[，。；;、.\s])",
-        clean_answer,
-    )
-    selected = match.group(1) if match else None
-    if selected is None:
-        for option in question.options or []:
-            text = str(option.get("text") or "").strip().upper()
-            key = str(option.get("key") or "").strip().upper()
-            if text and text in clean_answer:
-                selected = key
-                break
-    return float(selected == (question.correct_answer or "").strip().upper()), selected
-
-
-def _agent_test_prompt(question: Question) -> str:
-    if question.question_type == "single_choice":
-        options = "\n".join(
-            f"{str(option.get('key') or '').strip()}. {str(option.get('text') or '').strip()}"
-            for option in question.options or []
-        )
-        return (
-            "这是一道单选题。请依据知识库证据，从给定选项中选出唯一正确答案，"
-            "只输出选项字母（例如 A），不要输出解释。\n"
-            f"题目：{question.prompt}\n选项：\n{options}"
-        )
-    return f"这是一道问答题，请依据知识库证据直接回答。\n问题：{question.prompt}"
+# Backwards-compatible private names used by existing focused tests.
+_choice_score = choice_score
+_agent_test_prompt = agent_test_prompt
 
 
 def _summary(run: EvaluationRun, bank_name: str) -> TestRunSummary:
@@ -69,6 +44,9 @@ def _summary(run: EvaluationRun, bank_name: str) -> TestRunSummary:
         status=run.status,
         total_questions=run.total_questions,
         completed_questions=run.completed_questions,
+        attempt_count=run.attempt_count,
+        cancel_requested=run.cancel_requested,
+        error=run.error,
         started_at=run.started_at,
         finished_at=run.finished_at,
     )
@@ -136,11 +114,12 @@ async def get_test_run(run_id: UUID, db: DbSession) -> TestRunDetail:
     return await _detail(db, row[0], row[1])
 
 
-@router.post("", response_model=TestRunDetail, status_code=status.HTTP_201_CREATED)
+@router.post("", response_model=TestRunDetail, status_code=status.HTTP_202_ACCEPTED)
 async def run_question_bank_test(
     payload: TestRunCreate,
     db: DbSession,
     client: AgentClient,
+    queue: RunQueue,
 ) -> TestRunDetail:
     bank = await db.get(Dataset, payload.bank_id)
     if bank is None:
@@ -164,96 +143,92 @@ async def run_question_bank_test(
 
     run = EvaluationRun(
         dataset_id=bank.id,
-        status="running",
-        config={"execution_mode": "agent", "collection_id": collection_id},
+        status="queued",
+        config={
+            "execution_mode": "agent", "collection_id": collection_id,
+            "retrieval_scoring": "reference_text_v1", "scoring_top_k": 5,
+        },
         total_questions=len(questions),
         completed_questions=0,
     )
     db.add(run)
     await db.commit()
     await db.refresh(run)
+    try:
+        await queue.enqueue(run.id)
+    except Exception:
+        # The database is the source of truth. The dispatcher will retry while
+        # Redis is unavailable or if the API dies after this commit.
+        logger.exception("evaluation_initial_enqueue_failed", run_id=str(run.id))
+    return await _detail(db, run, bank.name)
 
-    successful = 0
-    for question in questions:
-        try:
-            result = await client.ask_agent(
-                content=_agent_test_prompt(question),
-                title=(
-                    f"题库测试：{bank.name} · "
-                    f"{'单选题' if question.question_type == 'single_choice' else '问答题'} · "
-                    f"{question.prompt[:80]}"
-                ),
-                collection_id=collection_id,
-                execution_mode="agent",
-            )
-            answer = str(result.get("content") or "")
-            citations = result.get("citations")
-            citations = (
-                [item for item in citations if isinstance(item, dict)]
-                if isinstance(citations, list)
-                else []
-            )
-            metadata = question.metadata_json or {}
-            expected_ids = (
-                [str(metadata["source_document_id"])] if metadata.get("source_document_id") else []
-            )
-            scores = evaluate_layers(
-                answer=answer,
-                citations=citations,
-                expected_document_ids=expected_ids,
-                reference_answer=(
-                    question.correct_answer
-                    if question.question_type == "single_choice"
-                    else question.gold_answer
-                ),
-                top_k=5,
-            )
-            if question.question_type == "single_choice":
-                choice_accuracy, selected = _choice_score(answer, question)
-                scores["answer"] = {
-                    "score": choice_accuracy,
-                    "metrics": {"choice_accuracy": choice_accuracy, "selected_option": selected},
-                    "issues": [] if choice_accuracy else ["incorrect_or_unrecognized_choice"],
-                }
-                layers = [
-                    scores["retrieval"]["score"],
-                    scores["citation"]["score"],
-                    choice_accuracy,
-                ]
-                available = [value for value in layers if value is not None]
-                scores["overall_score"] = sum(available) / len(available) if available else None
-                scores["gate_passed"] = (
-                    scores["citation"]["score"] >= 0.8 and choice_accuracy >= 0.5
-                )
-            db.add(
-                EvaluationResult(
-                    run_id=run.id,
-                    question_id=question.id,
-                    agent_run_id=str(result.get("run_id") or "") or None,
-                    answer=answer,
-                    metrics=scores,
-                    overall_score=scores["overall_score"],
-                    status="completed",
-                )
-            )
-            successful += 1
-        except PlatformServiceError as exc:
-            db.add(
-                EvaluationResult(
-                    run_id=run.id,
-                    question_id=question.id,
-                    metrics={},
-                    status="failed",
-                    error=exc.detail,
-                )
-            )
-        run.completed_questions += 1
-        await db.commit()
 
-    run.status = (
-        "completed" if successful == len(questions) else "partial" if successful else "failed"
-    )
-    run.finished_at = datetime.now(UTC)
+@router.post("/{run_id}/cancel", response_model=TestRunDetail)
+async def cancel_test_run(run_id: UUID, db: DbSession) -> TestRunDetail:
+    row = (
+        await db.execute(
+            select(EvaluationRun, Dataset.name)
+            .join(Dataset, Dataset.id == EvaluationRun.dataset_id)
+            .where(EvaluationRun.id == run_id)
+            .with_for_update()
+        )
+    ).first()
+    if row is None:
+        raise HTTPException(status_code=404, detail="测试记录不存在")
+    run, bank_name = row
+    if run.status in {"completed", "partial", "failed", "cancelled"}:
+        return await _detail(db, run, bank_name)
+    run.cancel_requested = True
+    if run.status == "queued":
+        run.status = "cancelled"
+        run.finished_at = datetime.now(UTC)
+    else:
+        run.status = "cancelling"
     await db.commit()
     await db.refresh(run)
-    return await _detail(db, run, bank.name)
+    return await _detail(db, run, bank_name)
+
+
+@router.post("/{run_id}/retry", response_model=TestRunDetail, status_code=status.HTTP_202_ACCEPTED)
+async def retry_test_run(run_id: UUID, db: DbSession, queue: RunQueue) -> TestRunDetail:
+    row = (
+        await db.execute(
+            select(EvaluationRun, Dataset.name)
+            .join(Dataset, Dataset.id == EvaluationRun.dataset_id)
+            .where(EvaluationRun.id == run_id)
+            .with_for_update()
+        )
+    ).first()
+    if row is None:
+        raise HTTPException(status_code=404, detail="测试记录不存在")
+    run, bank_name = row
+    if run.status not in {"partial", "failed", "cancelled"}:
+        raise HTTPException(status_code=409, detail="只有失败、部分失败或已取消的测试可以重试")
+
+    await db.execute(
+        delete(EvaluationResult).where(
+            EvaluationResult.run_id == run.id,
+            EvaluationResult.status != "completed",
+        )
+    )
+    completed = await db.scalar(
+        select(func.count(EvaluationResult.id)).where(
+            EvaluationResult.run_id == run.id,
+            EvaluationResult.status == "completed",
+        )
+    )
+    run.completed_questions = int(completed or 0)
+    run.status = "queued"
+    run.cancel_requested = False
+    run.worker_task_id = None
+    run.heartbeat_at = None
+    run.last_enqueued_at = None
+    run.error = None
+    run.finished_at = None
+    await db.commit()
+    await db.refresh(run)
+    try:
+        await queue.enqueue(run.id)
+    except Exception:
+        logger.exception("evaluation_retry_enqueue_failed", run_id=str(run.id))
+    return await _detail(db, run, bank_name)
